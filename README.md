@@ -31,6 +31,25 @@ If you want to peek before installing: **[shdennlin.github.io/claude-code-stats]
 
 ![Overview](docs/screenshots/01-overview.png)
 
+<details>
+<summary><b>More static views</b> — charts, projects detail, tools breakdown, session log (click to expand)</summary>
+
+> Reminder: these are just snapshots. The **[live demo](https://shdennlin.github.io/claude-code-stats/)** is interactive (sorting / filtering / drilldown / TZ toggle / merge rules) and shows everything below in one place.
+
+### Hours-by-day chart (sum vs union) · by hour-of-day · by weekday · top projects bar
+![Charts](docs/screenshots/02-charts.png)
+
+### Projects detail table (sortable, expandable rows, column toggle, Average basis dropdown)
+![Projects detail](docs/screenshots/03-projects-table.png)
+
+### By model · top skills · top tools · MCP servers · content composition · stop reason
+![Tools breakdown](docs/screenshots/04-tools-tables.png)
+
+### Session log (search & explore) — title / project / cost-sortable, full-text filter
+![Session log](docs/screenshots/05-session-log.png)
+
+</details>
+
 ## Install (detailed options)
 
 ```bash
