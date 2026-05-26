@@ -1,0 +1,1590 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Claude Code Stats</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#161922; --panel2:#1b1f2a; --line:#242a37;
+    --fg:#e6e6e6; --muted:#8a93a6; --accent:#7c9eff; --accent2:#a978ff;
+    --good:#5dd39e; --warn:#f5a35d; --bad:#f06c6c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"SF Pro Text",sans-serif}
+  header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  header h1{margin:0;font-size:16px;font-weight:600}
+  header .meta{color:var(--muted);font-size:12px}
+  main{padding:16px 20px;display:grid;gap:16px;max-width:1400px;margin:0 auto}
+  .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+  .card .val{font-size:20px;font-weight:600;margin-top:2px}
+  .card .sub{color:var(--muted);font-size:12px;margin-top:2px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+  .panel h2{margin:0 0 10px;font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+  .filters{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+  .field > label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+  input[type=date], input[type=text], select, button {
+    background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    padding:6px 8px;border-radius:6px;font:inherit;width:100%
+  }
+  button{cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  .projects-list{max-height:240px;overflow-y:auto;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px}
+  .projects-list label{display:flex;align-items:center;gap:6px;padding:3px 4px;cursor:pointer;font-size:12px}
+  .projects-list label:hover{background:var(--line)}
+  .projects-list input{margin:0;width:auto}
+  .actions{display:flex;gap:8px;flex-wrap:wrap}
+  .actions button{width:auto;padding:6px 12px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.05em}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tbody tr:hover{background:var(--panel2)}
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width: 900px){ .grid-2{grid-template-columns:1fr} }
+  .chart-wrap{position:relative;height:240px}
+  .chart-wrap.tall{height:300px}
+  .tag{display:inline-block;padding:2px 6px;border-radius:4px;background:var(--panel2);color:var(--muted);font-size:11px;margin:1px}
+  .muted{color:var(--muted)}
+  .rule-row{display:flex;gap:6px;align-items:center;margin-top:6px}
+  .rule-row input{flex:1}
+  .rule-list{margin-top:6px;display:flex;flex-direction:column;gap:4px}
+  .rule-pill{display:flex;align-items:center;justify-content:space-between;background:var(--panel2);padding:4px 8px;border-radius:6px;font-size:12px}
+  .rule-pill button{width:auto;padding:2px 8px;background:transparent;border-color:transparent;color:var(--muted)}
+  .rule-pill button:hover{color:var(--bad);border-color:var(--bad)}
+  .col-toggle{display:inline-flex;align-items:center;gap:4px;background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:3px 8px;font-size:12px;cursor:pointer;user-select:none}
+  .col-toggle input{margin:0;width:auto}
+  [data-hint]:hover{z-index:1001}
+  #t-projects{table-layout:fixed;width:100%}
+  #t-projects th{position:relative;padding-right:14px}
+  #t-projects th .th-label{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  #t-projects td{overflow:hidden;word-break:break-all;vertical-align:top}
+  .col-resizer{position:absolute;right:0;top:20%;width:4px;height:60%;cursor:col-resize;user-select:none;background:var(--line);border-radius:2px;opacity:.7;z-index:2}
+  .col-resizer:hover{background:var(--accent);opacity:1;width:5px}
+
+  /* custom tooltip — bigger and more readable than native title */
+  [data-hint]{position:relative}
+  [data-hint]:hover::after{
+    content: attr(data-hint);
+    position:absolute; z-index:1000;
+    left:0; top:calc(100% + 6px);
+    padding:10px 12px;
+    background:var(--panel2); border:1px solid var(--line); border-radius:6px;
+    color:var(--fg);
+    font-size:13px; font-weight:400; line-height:1.5;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    text-transform:none; letter-spacing:0;
+    white-space:normal; width:320px;
+    box-shadow:0 8px 24px rgba(0,0,0,0.5);
+    pointer-events:none;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Claude Code Stats</h1>
+  <div class="meta" id="meta"></div>
+</header>
+
+<main>
+
+  <section class="panel">
+    <h2>Filters</h2>
+    <div class="filters">
+      <div class="field">
+        <label>From</label>
+        <input type="date" id="from">
+      </div>
+      <div class="field">
+        <label>To</label>
+        <input type="date" id="to">
+      </div>
+      <div class="field">
+        <label>Display timezone</label>
+        <select id="display-tz">
+          <option value="scan">Scan TZ (default)</option>
+          <option value="local">Local (browser)</option>
+          <option value="utc">UTC</option>
+        </select>
+      </div>
+      <div class="field" style="grid-column: 1 / -1">
+        <label>Quick window</label>
+        <div id="quick-window-btns" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+      </div>
+      <div class="field" style="grid-column: 1 / -1">
+        <label>Merge projects (substring → label)</label>
+        <div class="rule-row">
+          <input type="text" id="merge-pattern" placeholder="pattern (substring of project path)">
+          <input type="text" id="merge-label" placeholder="label (display name)">
+          <button id="btn-add-merge" style="width:auto;padding:6px 12px">Add</button>
+        </div>
+        <div class="rule-list" id="merge-list"></div>
+      </div>
+      <div class="field" style="grid-column: 1 / -1">
+        <label>Projects (all selected by default; counts reflect date filter)</label>
+        <div class="projects-list" id="projects-list"></div>
+      </div>
+    </div>
+    <div class="actions" style="margin-top:10px">
+      <button id="btn-all">Select all</button>
+      <button id="btn-none">Clear</button>
+      <button id="btn-reset">Reset filters</button>
+      <button id="btn-clear-storage" title="Clear localStorage and reload">Reset saved state</button>
+      <button id="btn-export">Export filtered JSON</button>
+    </div>
+  </section>
+
+  <section class="row" id="summary-cards"></section>
+
+  <section class="panel">
+    <h2>Hours by day</h2>
+    <div class="chart-wrap tall"><canvas id="ch-daily"></canvas></div>
+  </section>
+
+  <section class="grid-2">
+    <div class="panel">
+      <h2>By hour of day (scan TZ)</h2>
+      <div class="chart-wrap"><canvas id="ch-hour"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>By weekday</h2>
+      <div class="chart-wrap"><canvas id="ch-weekday"></canvas></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Top projects (filtered)</h2>
+    <div class="chart-wrap tall"><canvas id="ch-projects"></canvas></div>
+  </section>
+
+  <section class="panel">
+    <h2>Projects detail (filtered, click headers to sort, click row to expand)</h2>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <label class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em">Average basis</label>
+      <select id="avg-basis" style="width:auto;min-width:280px"></select>
+      <span class="muted" id="avg-basis-tip" style="font-size:12px;flex:1"></span>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px" id="proj-col-toggles"></div>
+    <div style="overflow:auto">
+      <table id="t-projects">
+        <thead><tr id="t-projects-head"></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="grid-2">
+    <div class="panel">
+      <h2>By model</h2>
+      <table id="t-model">
+        <thead><tr>
+          <th>Model</th><th class="num">Msgs</th><th class="num">Tokens</th><th class="num">Cost</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Top skills</h2>
+      <table id="t-skill">
+        <thead><tr>
+          <th>Skill</th><th class="num">Msgs</th><th class="num">Tokens</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="grid-2">
+    <div class="panel">
+      <h2>Top tools</h2>
+      <table id="t-tool">
+        <thead><tr><th>Tool</th><th class="num">Uses</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>MCP servers</h2>
+      <table id="t-mcp">
+        <thead><tr><th>Server</th><th class="num">Tool calls</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="grid-2">
+    <div class="panel">
+      <h2>Content composition</h2>
+      <table id="t-content">
+        <thead><tr><th>Block type</th><th class="num">Count</th><th class="num">Share</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Stop reason</h2>
+      <table id="t-stop">
+        <thead><tr><th>Reason</th><th class="num">Count</th><th class="num">Share</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Session log (search &amp; explore)</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <input type="text" id="ses-filter" placeholder="Search title / project / session id…" style="flex:1;min-width:200px;width:auto;padding:6px 10px">
+      <label class="muted" style="font-size:11px;text-transform:uppercase">Show</label>
+      <select id="ses-limit" style="width:auto">
+        <option>50</option>
+        <option selected>100</option>
+        <option>300</option>
+        <option value="999999">All</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px" id="ses-col-toggles"></div>
+    <div style="overflow:auto;max-height:600px">
+      <table id="t-sessions">
+        <thead><tr id="t-sessions-head"></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="muted" id="ses-summary" style="font-size:12px;margin-top:8px"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Top git branches</h2>
+    <table id="t-branch">
+      <thead><tr>
+        <th>Branch</th>
+        <th class="num">Active</th>
+        <th class="num">Sessions</th>
+        <th class="num">Msgs</th>
+        <th class="num">Tokens</th>
+        <th class="num">Cost</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+</main>
+
+<script>
+const DATA = /*__CC_STATS_DATA__*/null;
+const STORAGE_KEY = 'cc-stats-v1';
+
+function countWeekdaysInRange(from, to) {
+  if (!from || !to || from > to) return 0;
+  let count = 0;
+  const start = new Date(from + 'T00:00:00Z');
+  const end = new Date(to + 'T00:00:00Z');
+  for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+    const dow = d.getUTCDay();
+    if (dow >= 1 && dow <= 5) count++;
+  }
+  return count;
+}
+
+function clampDate(d) {
+  if (!d || !DATA) return d;
+  if (d < DATA.summary.earliest) return DATA.summary.earliest;
+  if (d > DATA.summary.latest) return DATA.summary.latest;
+  return d;
+}
+
+function saveState() {
+  try {
+    const blob = {
+      from: state.from,
+      to: state.to,
+      projects: Array.from(state.projects),
+      mergeRules: state.mergeRules,
+      displayTz: state.displayTz,
+      projSort: state.projSort,
+      projCols: Array.from(state.projCols),
+      projColWidths: state.projColWidths,
+      quickPreset: state.quickPreset,
+      avgBasis: state.avgBasis,
+      sesSort: state.sesSort,
+      sesCols: Array.from(state.sesCols),
+      sesFilter: state.sesFilter,
+      sesLimit: state.sesLimit,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(blob));
+  } catch (e) { /* quota / private mode — silently ignore */ }
+}
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    const s = JSON.parse(raw);
+    if (s.from) state.from = clampDate(s.from);
+    if (s.to) state.to = clampDate(s.to);
+    if (Array.isArray(s.mergeRules)) state.mergeRules = s.mergeRules;
+    if (s.displayTz) state.displayTz = s.displayTz;
+    if (s.projSort) state.projSort = s.projSort;
+    if (Array.isArray(s.projCols)) state.projCols = new Set(s.projCols);
+    if (Array.isArray(s.projects)) state.projects = new Set(s.projects);
+    if (s.projColWidths && typeof s.projColWidths === 'object') state.projColWidths = s.projColWidths;
+    if (s.quickPreset !== undefined) state.quickPreset = s.quickPreset;
+    if (s.avgBasis && AVG_BASIS[s.avgBasis]) state.avgBasis = s.avgBasis;
+    if (s.sesSort && s.sesSort.key) state.sesSort = s.sesSort;
+    if (Array.isArray(s.sesCols)) state.sesCols = new Set(s.sesCols);
+    if (typeof s.sesFilter === 'string') state.sesFilter = s.sesFilter;
+    if (typeof s.sesLimit === 'number') state.sesLimit = s.sesLimit;
+    return true;
+  } catch (e) { return false; }
+}
+
+function clearStorage() {
+  try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+  location.reload();
+}
+
+const AVG_BASIS = {
+  active_days: {
+    label:'Active days (default)',
+    tip:'Numerator: project active. Denominator: days you actually worked this project (Days col). Answers: "intensity per day I opened it."',
+    numer: p => p.active_sec,
+    denom: p => p.days_active,
+  },
+  active_weekdays: {
+    label:'Active weekdays only',
+    tip:'Numerator: weekday-only active (Sat/Sun excluded). Denominator: WkDays you worked. Answers: "intensity on Mon-Fri I worked, ignoring weekend work."',
+    numer: p => p.weekday_active_sec,
+    denom: p => p.weekdays_active,
+  },
+  filter_weekdays: {
+    label:'Filter weekdays (spread)',
+    tip:'Numerator: total active. Denominator: ALL Mon-Fri in the filter window (regardless of whether you worked). Answers: "if I spread my work over every workday in this date range, how many hours per day."',
+    numer: p => p.active_sec,
+    denom: () => state._totalWeekdaysInRange || 0,
+  },
+  project_span_days: {
+    label:'Project span days (first→last)',
+    tip:'Numerator: total active. Denominator: days from project\'s first to last activity (inclusive). Answers: "treating the project as a daily routine while it was alive, how much per day."',
+    numer: p => p.active_sec,
+    denom: p => p.span_days,
+  },
+  project_span_weekdays: {
+    label:'Project span weekdays (first→last)',
+    tip:'Numerator: total active. Denominator: Mon-Fri count from first to last activity. Answers: "if I committed to working it every workday during its lifespan, how much per day."',
+    numer: p => p.active_sec,
+    denom: p => p.span_weekdays,
+  },
+  project_to_now_days: {
+    label:'Project to now (days)',
+    tip:'Numerator: total active. Denominator: days from first activity until report\'s latest data date. Answers: "as an ongoing daily commitment from start to now, how much per day."',
+    numer: p => p.active_sec,
+    denom: p => p.span_to_now_days,
+  },
+  project_to_now_weekdays: {
+    label:'Project to now (weekdays)',
+    tip:'Numerator: total active. Denominator: Mon-Fri count from first activity to report\'s latest data date. Answers: "as an ongoing weekday commitment from start to now, how much per workday."',
+    numer: p => p.active_sec,
+    denom: p => p.span_to_now_weekdays,
+  },
+};
+
+const SES_COLS = [
+  {key:'start',      label:'Start',    on:true,  num:false, sort:'start',
+   render: s => fmtTime(s.start)},
+  {key:'title',      label:'Title',    on:true,  num:false, sort:'title',
+   render: s => s.title || s.session_id.slice(0,8)},
+  {key:'project',    label:'Project',  on:true,  num:false, sort:'project',
+   render: s => s.project},
+  {key:'active_sec', label:'Active',   on:true,  num:true,  sort:'active_sec',
+   render: s => fmtHMS(s.active_sec)},
+  {key:'total_sec',  label:'Total',    on:false, num:true,  sort:'total_sec',
+   render: s => fmtHMS(s.total_sec)},
+  {key:'messages',   label:'Msgs',     on:true,  num:true,  sort:'messages',
+   render: s => fmtInt(s.messages)},
+  {key:'tokens',     label:'Tokens',   on:false, num:true,  sort:'tokens',
+   render: s => fmtTok(totalTokens(s.tokens))},
+  {key:'cost',       label:'Cost',     on:true,  num:true,  sort:'cost_usd',
+   render: s => fmtUSD(s.cost_usd)},
+  {key:'models',     label:'Models',   on:false, num:false, sort:null,
+   render: s => {
+     const span = document.createElement('span');
+     for (const m of (s.models||[])) {
+       const t = document.createElement('span');
+       t.className = 'tag'; t.textContent = m; span.appendChild(t);
+     }
+     return span;
+   }},
+];
+
+const PROJ_COLS = [
+  {key:'name', label:'Project', on:true, num:false, sort:'name',
+   hint:'Project path (cwd). Use Merge rules above to group multiple cwds under one label.',
+   render: p => p.name},
+  {key:'active_sec', label:'Active', on:true, num:true, sort:'active_sec',
+   hint:'Sum of gap durations (≤ gap-threshold) across this project’s sessions. Overlapping parallel sessions in the same project are double-counted (see Parallelism).',
+   render: p => fmtHMS(p.active_sec)},
+  {key:'union_sec', label:'Union', on:false, num:true, sort:'union_sec',
+   hint:'Wall-clock union of this project’s gaps (overlapping sessions within the project are deduped). Active − Union = self-overlap.',
+   render: p => fmtHMS(p.union_sec)},
+  {key:'parallelism', label:'Parallel', on:true, num:true, sort:'parallelism',
+   hint:'Active ÷ Union. 1.00× = no overlap within this project. Higher = more parallel sessions in the same project (e.g., multiple tmux panes).',
+   render: p => p.parallelism > 0 ? p.parallelism.toFixed(2)+'×' : '—'},
+  {key:'total_sec', label:'Total', on:false, num:true, sort:'total_sec',
+   hint:'Wall-clock total: sum of (last − first message) per session. Includes idle gaps.',
+   render: p => fmtHMS(p.total_sec)},
+  {key:'ratio', label:'A/T %', on:true, num:true, sort:'ratio',
+   hint:'Active ÷ Total. How much of the open-session time was actually interactive (gaps ≤ gap-threshold). Low % means sessions were left open during long thinks/reads/breaks.',
+   render: p => p.ratio.toFixed(1)+'%'},
+  {key:'share', label:'% share', on:true, num:true, sort:'share',
+   hint:'project.active_sec ÷ Σ(selected projects’ active_sec) × 100. Sum-based (not union), so with parallel sessions both numerator and denominator are inflated. Selected projects sum to 100%.',
+   render: p => p.share.toFixed(1)+'%'},
+  {key:'sessions', label:'Sess', on:true, num:true, sort:'sessions',
+   hint:'Number of distinct Claude Code sessions (one .jsonl file each).',
+   render: p => String(p.sessions)},
+  {key:'sessions_per_day', label:'Sess/day', on:true, num:true, sort:'sessions_per_day',
+   hint:'sessions ÷ Days. How many separate Claude Code sessions you opened per active day for this project. 1 = single long session; 5+ = many short sessions / context switches.',
+   render: p => p.sessions_per_day.toFixed(1)},
+  {key:'messages', label:'Msgs', on:true, num:true, sort:'messages',
+   hint:'Total message events (user + assistant + tool results).',
+   render: p => p.messages.toLocaleString()},
+  {key:'days_active', label:'Days', on:false, num:true, sort:'days_active',
+   hint:'Count of distinct dates (Mon–Sun, scan TZ) with any activity for this project. Compare with WkDays: Days − WkDays = weekend days worked. If Days == WkDays you never touched this project on Sat/Sun.',
+   render: p => String(p.days_active)},
+  {key:'avg_per_day', label:'Avg', on:true, num:true, sort:'avg_per_day',
+   hint:'Average per day. Denominator depends on "Average basis" dropdown above the table. Hover the basis dropdown to see what each choice means.',
+   render: p => (p.avg_per_day/3600).toFixed(2)+'h'},
+  {key:'weekdays_active', label:'WkDays', on:false, num:true, sort:'weekdays_active',
+   hint:'Count of Mon–Fri dates (Sat/Sun excluded) on which you actually had activity for this project, within the filter range.',
+   render: p => String(p.weekdays_active)},
+  {key:'tokens_total', label:'Tokens', on:false, num:true, sort:'tokens_total',
+   hint:'input + output + cache_create (5m+1h) + cache_read.',
+   render: p => fmtTok(p.tokens_total)},
+  {key:'cost', label:'Cost', on:true, num:true, sort:'cost',
+   hint:'Estimated USD if paid pay-as-you-go API. Max-plan subscribers don’t pay this; it’s an equivalent-cost reference.',
+   render: p => fmtUSD(p.cost)},
+  {key:'first', label:'First', on:false, num:false, sort:'first',
+   hint:'Earliest timestamp seen for this project (in display TZ).',
+   render: p => fmtTime(p.first)},
+  {key:'last', label:'Last', on:false, num:false, sort:'last',
+   hint:'Latest timestamp seen for this project (in display TZ).',
+   render: p => fmtTime(p.last)},
+  {key:'models', label:'Models', on:false, num:false, sort:null,
+   hint:'Distinct Claude model IDs that handled this project’s sessions.',
+   render: p => {
+     const span = document.createElement('span');
+     for (const m of p.models_arr) {
+       const t = document.createElement('span');
+       t.className = 'tag'; t.textContent = m; span.appendChild(t);
+     }
+     return span;
+   }},
+];
+
+const state = {
+  from: null, to: null,
+  projects: new Set(),   // selected merged-project labels
+  mergeRules: [],        // [{pattern, label}]
+  displayTz: 'scan',     // 'scan' | 'local' | 'utc'
+  projSort: {key: 'active_sec', dir: -1},
+  projCols: new Set(PROJ_COLS.filter(c => c.on).map(c => c.key)),
+  expandedProject: null,
+  quickPreset: null,
+  projColWidths: {},
+  avgBasis: 'active_days',
+  _totalWeekdaysInRange: 0,
+  sesSort: {key: 'active_sec', dir: -1},
+  sesCols: new Set(SES_COLS.filter(c => c.on).map(c => c.key)),
+  sesFilter: '',
+  sesLimit: 100,
+};
+
+function startResize(ev, th, key) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const startX = ev.clientX;
+  const startW = th.getBoundingClientRect().width;
+  function onMove(e) {
+    const w = Math.max(40, startW + (e.clientX - startX));
+    th.style.width = w + 'px';
+    state.projColWidths[key] = w;
+  }
+  function onUp() {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    saveState();
+  }
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+const charts = {};
+
+// ---------- helpers ----------
+const fmtInt = (n) => Number(n).toLocaleString();
+const fmtNum = (n, d=2) => Number(n).toLocaleString(undefined, {minimumFractionDigits:d, maximumFractionDigits:d});
+const fmtHMS = (s) => {
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  return fmtInt(h) + 'h ' + String(m).padStart(2,'0') + 'm ' + String(sec).padStart(2,'0') + 's';
+};
+const fmtH = (s) => fmtNum(s/3600, 1);
+const fmtTok = (n) => n >= 1e9 ? fmtNum(n/1e9, 2)+'B' : n >= 1e6 ? fmtNum(n/1e6, 2)+'M' : n >= 1e3 ? fmtNum(n/1e3, 1)+'k' : fmtInt(n);
+const fmtUSD = (n) => '$' + fmtNum(n, 2);
+
+function el(tag, attrs, ...children) {
+  const e = document.createElement(tag);
+  if (attrs) for (const [k,v] of Object.entries(attrs)) {
+    if (k === 'class') e.className = v;
+    else if (k === 'style') e.setAttribute('style', v);
+    else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
+  }
+  for (const c of children) {
+    if (c == null) continue;
+    e.appendChild(typeof c === 'string' || typeof c === 'number' ? document.createTextNode(String(c)) : c);
+  }
+  return e;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+function applyMerge(name) {
+  const lower = name.toLowerCase();
+  for (const r of state.mergeRules) {
+    if (r.pattern && lower.indexOf(r.pattern.toLowerCase()) !== -1) return r.label;
+  }
+  return name;
+}
+
+function totalTokens(t) {
+  return t.input + t.output + t.cache_create_5m + t.cache_create_1h + t.cache_read;
+}
+
+function fmtTime(iso) {
+  if (!iso) return '';
+  if (state.displayTz === 'scan') {
+    // strip "T" -> space, drop offset for compactness; iso is "YYYY-MM-DDTHH:MM:SS+08:00"
+    const m = iso.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/);
+    return m ? (m[1] + ' ' + m[2]) : iso;
+  }
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  if (state.displayTz === 'utc') {
+    return d.toISOString().replace('T',' ').replace(/\.\d+Z$/, ' UTC');
+  }
+  // local browser
+  const pad = n => String(n).padStart(2,'0');
+  return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
+}
+
+function isoToDateKey(iso) {
+  // get the date the session was bucketed under (scan TZ)
+  return iso ? iso.slice(0,10) : '';
+}
+
+// ---------- init ----------
+function init() {
+  if (!DATA) { document.body.appendChild(el('p', {style:'padding:40px'}, 'No data embedded.')); return; }
+
+  const metaParts = [
+    DATA.summary.earliest + ' → ' + DATA.summary.latest,
+    'generated ' + DATA.summary.generated_at,
+    'gap=' + DATA.summary.gap_threshold_min + 'm',
+    'scan TZ=' + DATA.summary.tz_offset,
+  ];
+  document.getElementById('meta').textContent = metaParts.join(' · ');
+
+  // default window: last N days from latest, where N comes from CLI default_window_days
+  const window = DATA.summary.default_window_days || 90;
+  const latest = DATA.summary.latest;
+  const earliest = DATA.summary.earliest;
+  let from = earliest;
+  if (window > 0) {
+    const ld = new Date(latest + 'T00:00:00Z');
+    const fd = new Date(ld.getTime() - (window-1)*86400000);
+    const fdStr = fd.toISOString().slice(0,10);
+    from = fdStr > earliest ? fdStr : earliest;
+  }
+  state.from = from;
+  state.to = latest;
+
+  // overlay saved state (clamped) — must run AFTER defaults are set
+  const loaded = loadState();
+
+  document.getElementById('from').value = state.from;
+  document.getElementById('to').value = state.to;
+  document.getElementById('display-tz').value = state.displayTz;
+  renderMergeList();
+
+  // listeners
+  document.getElementById('from').addEventListener('change', e => { state.from = e.target.value; state.quickPreset = null; renderQuickButtons(); rebuild(); });
+  document.getElementById('to').addEventListener('change', e => { state.to = e.target.value; state.quickPreset = null; renderQuickButtons(); rebuild(); });
+  document.getElementById('display-tz').addEventListener('change', e => { state.displayTz = e.target.value; render(); });
+  document.getElementById('btn-all').addEventListener('click', () => selectAll(true));
+  document.getElementById('btn-none').addEventListener('click', () => selectAll(false));
+  document.getElementById('btn-reset').addEventListener('click', resetFilters);
+  document.getElementById('btn-export').addEventListener('click', exportFiltered);
+  document.getElementById('btn-add-merge').addEventListener('click', addMergeRule);
+  document.getElementById('btn-clear-storage').addEventListener('click', clearStorage);
+  document.getElementById('merge-label').addEventListener('keydown', e => { if (e.key === 'Enter') addMergeRule(); });
+  document.getElementById('merge-pattern').addEventListener('keydown', e => { if (e.key === 'Enter') addMergeRule(); });
+
+  renderColumnToggles();
+  renderQuickButtons();
+  renderAvgBasis();
+  renderSessionLogToggles();
+  const sesFilterInput = document.getElementById('ses-filter');
+  const sesLimitSelect = document.getElementById('ses-limit');
+  if (sesFilterInput) {
+    sesFilterInput.value = state.sesFilter;
+    sesFilterInput.addEventListener('input', e => { state.sesFilter = e.target.value; render(); });
+  }
+  if (sesLimitSelect) {
+    sesLimitSelect.value = String(state.sesLimit);
+    sesLimitSelect.addEventListener('change', e => { state.sesLimit = parseInt(e.target.value, 10) || 100; render(); });
+  }
+  rebuild();
+}
+
+function renderAvgBasis() {
+  const sel = document.getElementById('avg-basis');
+  if (!sel) return;
+  clear(sel);
+  for (const [key, def] of Object.entries(AVG_BASIS)) {
+    const opt = document.createElement('option');
+    opt.value = key;
+    opt.textContent = def.label;
+    if (key === state.avgBasis) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.onchange = e => {
+    state.avgBasis = e.target.value;
+    updateAvgBasisTip();
+    render();
+  };
+  updateAvgBasisTip();
+}
+
+function updateAvgBasisTip() {
+  const tip = document.getElementById('avg-basis-tip');
+  if (!tip) return;
+  const def = AVG_BASIS[state.avgBasis];
+  tip.textContent = def ? def.tip : '';
+}
+
+const QUICK_PRESETS = [
+  {key:'this_week',  label:'This week'},
+  {key:'last_week',  label:'Last week'},
+  {key:'7d',         label:'Last 7 days'},
+  {key:'this_month', label:'This month'},
+  {key:'last_month', label:'Last month'},
+  {key:'30d',        label:'Last 30 days'},
+  {key:'3m',         label:'Last 3 months'},
+  {key:'6m',         label:'Last 6 months'},
+  {key:'1y',         label:'Last 1 year'},
+  {key:'all',        label:'All time'},
+];
+
+function applyPreset(key) {
+  const latest = DATA.summary.latest;
+  const earliest = DATA.summary.earliest;
+  const ref = new Date(latest + 'T12:00:00Z'); // anchor at latest data
+  const toIso = d => d.toISOString().slice(0,10);
+  let from = earliest, to = latest;
+
+  switch (key) {
+    case 'this_week': {
+      const day = ref.getUTCDay();
+      const dayFromMon = (day + 6) % 7;
+      const mon = new Date(ref); mon.setUTCDate(ref.getUTCDate() - dayFromMon);
+      from = toIso(mon); to = latest;
+      break;
+    }
+    case 'last_week': {
+      const day = ref.getUTCDay();
+      const dayFromMon = (day + 6) % 7;
+      const lastSun = new Date(ref); lastSun.setUTCDate(ref.getUTCDate() - dayFromMon - 1);
+      const lastMon = new Date(lastSun); lastMon.setUTCDate(lastSun.getUTCDate() - 6);
+      from = toIso(lastMon); to = toIso(lastSun);
+      break;
+    }
+    case 'this_month': {
+      const m = new Date(Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth(), 1));
+      from = toIso(m); to = latest;
+      break;
+    }
+    case 'last_month': {
+      const m = new Date(Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth()-1, 1));
+      const end = new Date(Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth(), 0));
+      from = toIso(m); to = toIso(end);
+      break;
+    }
+    case '7d': case '30d': case '3m': case '6m': case '1y': {
+      const days = {'7d':7, '30d':30, '3m':90, '6m':180, '1y':365}[key];
+      const d = new Date(ref); d.setUTCDate(ref.getUTCDate() - (days-1));
+      from = toIso(d); to = latest;
+      break;
+    }
+    case 'all':
+    default:
+      from = earliest; to = latest;
+  }
+  if (from < earliest) from = earliest;
+  if (to > latest) to = latest;
+  state.from = from; state.to = to;
+  state.quickPreset = key;
+  document.getElementById('from').value = from;
+  document.getElementById('to').value = to;
+  renderQuickButtons();
+  rebuild();
+}
+
+function renderQuickButtons() {
+  const wrap = document.getElementById('quick-window-btns');
+  if (!wrap) return;
+  clear(wrap);
+  for (const preset of QUICK_PRESETS) {
+    const b = el('button', null, preset.label);
+    b.style.width = 'auto';
+    b.style.padding = '6px 10px';
+    if (state.quickPreset === preset.key) {
+      b.style.borderColor = 'var(--accent)';
+      b.style.color = 'var(--accent)';
+    }
+    b.addEventListener('click', () => applyPreset(preset.key));
+    wrap.appendChild(b);
+  }
+}
+
+// ---------- merge rules ----------
+function addMergeRule() {
+  const pat = document.getElementById('merge-pattern').value.trim();
+  const lab = document.getElementById('merge-label').value.trim() || pat;
+  if (!pat) return;
+  state.mergeRules.push({pattern: pat, label: lab});
+  document.getElementById('merge-pattern').value = '';
+  document.getElementById('merge-label').value = '';
+  renderMergeList();
+  rebuild();
+}
+
+function removeMergeRule(idx) {
+  state.mergeRules.splice(idx, 1);
+  renderMergeList();
+  rebuild();
+}
+
+function renderMergeList() {
+  const list = document.getElementById('merge-list');
+  clear(list);
+  state.mergeRules.forEach((r, i) => {
+    const pill = el('div', {class:'rule-pill'},
+      el('span', null,
+        el('span', {class:'muted'}, 'match '),
+        r.pattern,
+        el('span', {class:'muted'}, ' → '),
+        r.label,
+      ),
+      el('button', {onclick: () => removeMergeRule(i)}, '×')
+    );
+    list.appendChild(pill);
+  });
+}
+
+// ---------- rebuild (project list changes) ----------
+function rebuild() {
+  const merged = mergedSessions();
+  const projInRange = aggregateProjects(merged.sessions, state.from, state.to);
+  const newSelected = new Set();
+  const prevHad = state.projects.size > 0;
+  for (const p of projInRange) {
+    if (!prevHad || state.projects.has(p.name)) newSelected.add(p.name);
+  }
+  // Guard: if user had a selection but nothing intersects (stale state or
+  // filter narrowed projects out), default to all in range instead of locking
+  // them out of seeing data.
+  if (prevHad && newSelected.size === 0 && projInRange.length > 0) {
+    for (const p of projInRange) newSelected.add(p.name);
+  }
+  state.projects = newSelected;
+  renderProjectList(projInRange);
+  render();
+}
+
+function mergedSessions() {
+  const sessions = DATA.sessions.map(s => ({
+    ...s,
+    project: applyMerge(s.project),
+  }));
+  const dailyByProj = DATA.daily.map(d => {
+    const by = {};
+    const byU = {};
+    for (const [proj, sec] of Object.entries(d.by_project || {})) {
+      const m = applyMerge(proj);
+      by[m] = (by[m] || 0) + sec;
+    }
+    for (const [proj, sec] of Object.entries(d.union_by_project || {})) {
+      const m = applyMerge(proj);
+      // sum is an upper bound when sub-projects are merged
+      byU[m] = (byU[m] || 0) + sec;
+    }
+    return {date: d.date, active_sec_union: d.active_sec_union || 0, by_project: by, union_by_project: byU};
+  });
+  return {sessions, daily: dailyByProj};
+}
+
+function getMergedProject(name) {
+  const merged = {
+    name,
+    by_hour: new Array(24).fill(0),
+    by_weekday: new Array(7).fill(0),
+    by_skill: {},
+    by_tool: {},
+  };
+  for (const p of DATA.projects) {
+    if (applyMerge(p.name) !== name) continue;
+    for (let i = 0; i < 24; i++) merged.by_hour[i] += (p.by_hour || [])[i] || 0;
+    for (let i = 0; i < 7; i++) merged.by_weekday[i] += (p.by_weekday || [])[i] || 0;
+    for (const [s, c] of Object.entries(p.by_skill || {})) {
+      merged.by_skill[s] = (merged.by_skill[s] || 0) + c;
+    }
+    for (const [s, c] of Object.entries(p.by_tool || {})) {
+      merged.by_tool[s] = (merged.by_tool[s] || 0) + c;
+    }
+  }
+  return merged;
+}
+
+function aggregateProjects(sessions, from, to) {
+  const map = new Map();
+  for (const s of sessions) {
+    const d = isoToDateKey(s.start);
+    if (d < from || d > to) continue;
+    let p = map.get(s.project);
+    if (!p) { p = {name: s.project, active_sec: 0, sessions: 0, messages: 0}; map.set(s.project, p); }
+    p.active_sec += s.active_sec;
+    p.sessions += 1;
+    p.messages += s.messages;
+  }
+  return Array.from(map.values()).sort((a,b)=>b.active_sec-a.active_sec);
+}
+
+function renderProjectList(projInRange) {
+  const list = document.getElementById('projects-list');
+  clear(list);
+  for (const p of projInRange) {
+    const cb = el('input', {type:'checkbox'});
+    cb.checked = state.projects.has(p.name);
+    cb.addEventListener('change', (e) => {
+      if (e.target.checked) state.projects.add(p.name); else state.projects.delete(p.name);
+      render();
+    });
+    const row = el('label', null,
+      cb,
+      el('span', {style:'flex:1'}, p.name),
+      el('span', {class:'muted'}, fmtH(p.active_sec) + 'h · ' + p.sessions + 'ses'),
+    );
+    list.appendChild(row);
+  }
+  if (projInRange.length === 0) {
+    list.appendChild(el('div', {class:'muted', style:'padding:8px'}, 'No projects in range.'));
+  }
+}
+
+function selectAll(yes) {
+  state.projects.clear();
+  for (const cb of document.querySelectorAll('#projects-list input[type=checkbox]')) {
+    cb.checked = yes;
+  }
+  if (yes) {
+    const merged = mergedSessions();
+    for (const p of aggregateProjects(merged.sessions, state.from, state.to)) state.projects.add(p.name);
+  }
+  render();
+}
+
+function resetFilters() {
+  state.mergeRules = [];
+  state.expandedProject = null;
+  renderMergeList();
+  // pick the preset that matches DATA.summary.default_window_days
+  const w = DATA.summary.default_window_days || 0;
+  let key = 'all';
+  if (w === 7) key = '7d';
+  else if (w === 30) key = '30d';
+  else if (w === 90) key = '3m';
+  else if (w === 180) key = '6m';
+  else if (w === 365) key = '1y';
+  applyPreset(key);
+}
+
+// ---------- filtered computation ----------
+function inRange(d) { return d >= state.from && d <= state.to; }
+
+function computeFiltered() {
+  const merged = mergedSessions();
+  const f = {
+    active: 0, sessions: 0, messages: 0, cost: 0,
+    tokens: {input:0, output:0, cache_create_5m:0, cache_create_1h:0, cache_read:0, iterations:0},
+    days: 0,
+  };
+  const sessions = merged.sessions.filter(s => {
+    const d = isoToDateKey(s.start);
+    return inRange(d) && state.projects.has(s.project);
+  });
+  f.sessions = sessions.length;
+  for (const s of sessions) {
+    f.active += s.active_sec;
+    f.messages += s.messages;
+    f.cost += s.cost_usd;
+    f.tokens.input += s.tokens.input;
+    f.tokens.output += s.tokens.output;
+    f.tokens.cache_create_5m += s.tokens.cache_create_5m;
+    f.tokens.cache_create_1h += s.tokens.cache_create_1h;
+    f.tokens.cache_read += s.tokens.cache_read;
+    f.tokens.iterations += s.tokens.iterations;
+  }
+  const a = new Date(state.from), b = new Date(state.to);
+  f.days = Math.max(1, Math.round((b - a) / 86400000) + 1);
+
+  const daily = [];
+  let unionTotal = 0;
+  // map date -> union from raw DATA.daily (union is project-independent)
+  const unionByDate = {};
+  for (const d of DATA.daily) unionByDate[d.date] = d.active_sec_union || 0;
+
+  for (const d of merged.daily) {
+    if (!inRange(d.date)) continue;
+    let active = 0;
+    for (const [proj, sec] of Object.entries(d.by_project)) {
+      if (state.projects.has(proj)) active += sec;
+    }
+    const u = unionByDate[d.date] || 0;
+    // If user has selected all projects, union is exact. If subset, union shown as upper bound (cross-project).
+    daily.push({date: d.date, active_sec: active, active_sec_union: u});
+    unionTotal += u;
+  }
+  f.daily = daily;
+  f.sessions_list = sessions;
+  f.union = unionTotal;
+  return f;
+}
+
+// ---------- render ----------
+function render() {
+  const f = computeFiltered();
+  renderCards(f);
+  renderDaily(f);
+  renderHour(f);
+  renderWeekday(f);
+  renderProjects(f);
+  renderProjectsTable(f);
+  renderModel(f);
+  renderSkill(f);
+  renderTool(f);
+  renderMcp(f);
+  renderContent(f);
+  renderStop(f);
+  renderBranch(f);
+  renderSessionLog(f);
+  saveState();
+}
+
+function renderSessionLog(f) {
+  // build header
+  const thead = document.getElementById('t-sessions-head');
+  if (!thead) return;
+  clear(thead);
+  const activeCols = SES_COLS.filter(c => state.sesCols.has(c.key));
+  for (const c of activeCols) {
+    const th = document.createElement('th');
+    th.textContent = c.label;
+    if (c.num) th.className = 'num';
+    if (c.sort) {
+      th.setAttribute('data-ses-sort', c.sort);
+      th.style.cursor = 'pointer';
+      th.addEventListener('click', () => {
+        if (state.sesSort.key === c.sort) state.sesSort.dir *= -1;
+        else { state.sesSort.key = c.sort; state.sesSort.dir = (c.num) ? -1 : 1; }
+        render();
+      });
+      if (state.sesSort.key === c.sort) {
+        th.textContent = c.label + (state.sesSort.dir > 0 ? ' ↑' : ' ↓');
+      }
+    }
+    thead.appendChild(th);
+  }
+
+  // filter + sort
+  const q = state.sesFilter.trim().toLowerCase();
+  let rows = f.sessions_list.filter(s => {
+    if (!q) return true;
+    return (s.title || '').toLowerCase().includes(q)
+        || (s.project || '').toLowerCase().includes(q)
+        || (s.session_id || '').toLowerCase().includes(q);
+  });
+  const sortKey = state.sesSort.key, dir = state.sesSort.dir;
+  rows.sort((a, b) => {
+    let av = a[sortKey], bv = b[sortKey];
+    if (sortKey === 'tokens') { av = totalTokens(a.tokens); bv = totalTokens(b.tokens); }
+    if (sortKey === 'title')  { av = a.title || a.session_id; bv = b.title || b.session_id; }
+    if (typeof av === 'string') return av.localeCompare(bv) * dir;
+    return ((av || 0) - (bv || 0)) * dir;
+  });
+  const totalMatched = rows.length;
+  const limit = state.sesLimit;
+  const shown = rows.slice(0, limit);
+
+  // body
+  const cellFns = activeCols.map(c => s => {
+    const v = c.render(s);
+    if (v && v.nodeType) return v;
+    return c.num ? [v, 'num'] : v;
+  });
+  fillTable('#t-sessions tbody', shown, cellFns);
+
+  // summary line
+  const sum = document.getElementById('ses-summary');
+  if (sum) {
+    sum.textContent = totalMatched === 0
+      ? `No sessions match "${state.sesFilter}"`
+      : `Showing ${fmtInt(shown.length)} of ${fmtInt(totalMatched)} matching sessions (filtered total ${fmtInt(f.sessions_list.length)}).`;
+  }
+}
+
+function renderSessionLogToggles() {
+  const wrap = document.getElementById('ses-col-toggles');
+  if (!wrap) return;
+  clear(wrap);
+  for (const c of SES_COLS) {
+    const cb = el('input', {type:'checkbox'});
+    cb.checked = state.sesCols.has(c.key);
+    cb.addEventListener('change', e => {
+      if (e.target.checked) state.sesCols.add(c.key);
+      else state.sesCols.delete(c.key);
+      render();
+    });
+    const lbl = el('label', {class:'col-toggle'}, cb, document.createTextNode(' '+c.label));
+    wrap.appendChild(lbl);
+  }
+}
+
+function renderTool(f) {
+  fillTable('#t-tool tbody', DATA.by_tool.slice(0, 25), [
+    t => t.name,
+    t => [fmtInt(t.count), 'num'],
+  ]);
+}
+
+function renderMcp(f) {
+  if (!DATA.by_mcp_server.length) {
+    document.querySelector('#t-mcp tbody').innerHTML = '';
+    return;
+  }
+  fillTable('#t-mcp tbody', DATA.by_mcp_server, [
+    m => m.name,
+    m => [fmtInt(m.count), 'num'],
+  ]);
+}
+
+function renderContent(f) {
+  const total = DATA.by_content_type.reduce((s,c) => s+c.count, 0) || 1;
+  fillTable('#t-content tbody', DATA.by_content_type, [
+    c => c.name,
+    c => [fmtInt(c.count), 'num'],
+    c => [(c.count/total*100).toFixed(1)+'%', 'num'],
+  ]);
+}
+
+function renderStop(f) {
+  const total = DATA.by_stop_reason.reduce((s,c) => s+c.count, 0) || 1;
+  fillTable('#t-stop tbody', DATA.by_stop_reason, [
+    c => c.name,
+    c => [fmtInt(c.count), 'num'],
+    c => [(c.count/total*100).toFixed(1)+'%', 'num'],
+  ]);
+}
+
+function renderBranch(f) {
+  fillTable('#t-branch tbody', DATA.by_branch.slice(0, 25), [
+    b => b.name,
+    b => [fmtHMS(b.active_sec), 'num'],
+    b => [fmtInt(b.sessions), 'num'],
+    b => [fmtInt(b.messages), 'num'],
+    b => [fmtTok(b.tokens.input + b.tokens.output + b.tokens.cache_create_5m + b.tokens.cache_create_1h + b.tokens.cache_read), 'num'],
+    b => [fmtUSD(b.cost_usd), 'num'],
+  ]);
+}
+
+function renderProjectsTable(f) {
+  // aggregate sessions_list by project
+  const map = new Map();
+  let grand = 0;
+  for (const s of f.sessions_list) {
+    let p = map.get(s.project);
+    if (!p) {
+      p = {
+        name: s.project,
+        active_sec: 0, union_sec: 0, total_sec: 0, sessions: 0, messages: 0,
+        tokens_total: 0, cost: 0,
+        first: s.start, last: s.end,
+        models: new Set(),
+        days_set: new Set(),
+      };
+      map.set(s.project, p);
+    }
+    p.active_sec += s.active_sec;
+    p.total_sec += s.total_sec;
+    p.sessions += 1;
+    p.messages += s.messages;
+    p.tokens_total += totalTokens(s.tokens);
+    p.cost += s.cost_usd;
+    if (s.start < p.first) p.first = s.start;
+    if (s.end > p.last) p.last = s.end;
+    for (const m of (s.models || [])) p.models.add(m);
+    grand += s.active_sec;
+  }
+  // count distinct active days per project from merged daily (incl. weekday-only sums + union)
+  const merged = mergedSessions();
+  for (const p of map.values()) {
+    p.weekday_active_sec = 0;
+    p.weekdays_set = new Set();
+  }
+  for (const d of merged.daily) {
+    if (d.date < state.from || d.date > state.to) continue;
+    const dow = new Date(d.date + 'T00:00:00Z').getUTCDay(); // 0=Sun..6=Sat
+    const isWeekday = dow >= 1 && dow <= 5;
+    for (const [proj, sec] of Object.entries(d.by_project)) {
+      if (sec > 0 && state.projects.has(proj)) {
+        const p = map.get(proj);
+        if (p) {
+          p.days_set.add(d.date);
+          if (isWeekday) {
+            p.weekdays_set.add(d.date);
+            p.weekday_active_sec += sec;
+          }
+        }
+      }
+    }
+    // per-project union: sum per-day unions (upper bound when sub-projects merged)
+    for (const [proj, sec] of Object.entries(d.union_by_project || {})) {
+      if (sec > 0 && state.projects.has(proj)) {
+        const p = map.get(proj);
+        if (p) p.union_sec += sec;
+      }
+    }
+  }
+  // total Mon–Fri days in filter window (regardless of activity)
+  const totalWeekdaysInRange = countWeekdaysInRange(state.from, state.to);
+  state._totalWeekdaysInRange = totalWeekdaysInRange;
+  const today = DATA.summary.latest;
+  const rows = Array.from(map.values()).map(p => {
+    const days_active = p.days_set.size;
+    const weekdays_active = p.weekdays_set.size;
+    const first = p.first ? p.first.slice(0,10) : null;
+    const last = p.last ? p.last.slice(0,10) : null;
+    const span_days = (first && last) ? Math.max(1, Math.round((new Date(last+'T00:00:00Z') - new Date(first+'T00:00:00Z'))/86400000) + 1) : 0;
+    const span_weekdays = (first && last) ? countWeekdaysInRange(first, last) : 0;
+    const span_to_now_days = (first && today) ? Math.max(1, Math.round((new Date(today+'T00:00:00Z') - new Date(first+'T00:00:00Z'))/86400000) + 1) : 0;
+    const span_to_now_weekdays = (first && today) ? countWeekdaysInRange(first, today) : 0;
+    const row = {
+      ...p,
+      ratio: p.total_sec > 0 ? p.active_sec / p.total_sec * 100 : 0,
+      share: grand > 0 ? p.active_sec / grand * 100 : 0,
+      days_active,
+      weekdays_active,
+      sessions_per_day: days_active > 0 ? p.sessions / days_active : 0,
+      span_days, span_weekdays, span_to_now_days, span_to_now_weekdays,
+      parallelism: p.union_sec > 0 ? p.active_sec / p.union_sec : 0,
+      models_arr: Array.from(p.models),
+    };
+    // dynamic Avg based on selected basis
+    const basis = AVG_BASIS[state.avgBasis] || AVG_BASIS.active_days;
+    const n = basis.numer(row);
+    const d = basis.denom(row);
+    row.avg_per_day = d > 0 ? n / d : 0;
+    return row;
+  });
+  const k = state.projSort.key, dir = state.projSort.dir;
+  rows.sort((a, b) => {
+    const av = a[k], bv = b[k];
+    if (typeof av === 'string') return av.localeCompare(bv) * dir;
+    return (av - bv) * dir;
+  });
+
+  // build header dynamically based on visible columns
+  const thead = document.getElementById('t-projects-head');
+  clear(thead);
+  const activeCols = PROJ_COLS.filter(c => state.projCols.has(c.key));
+  for (const c of activeCols) {
+    const th = document.createElement('th');
+    // label wrapped in span so overflow:hidden lives on .th-label, not on th
+    // (th must allow tooltip pseudo-element to overflow)
+    const lblSpan = document.createElement('span');
+    lblSpan.className = 'th-label';
+    lblSpan.textContent = c.label;
+    th.appendChild(lblSpan);
+    if (c.num) th.className = 'num';
+    if (c.sort) th.setAttribute('data-sort', c.sort);
+    if (c.hint) th.setAttribute('data-hint', c.hint);
+    if (state.projColWidths && state.projColWidths[c.key]) {
+      th.style.width = state.projColWidths[c.key] + 'px';
+    }
+    const resizer = document.createElement('div');
+    resizer.className = 'col-resizer';
+    resizer.addEventListener('mousedown', (ev) => startResize(ev, th, c.key));
+    resizer.addEventListener('click', (ev) => { ev.stopPropagation(); });
+    th.appendChild(resizer);
+    thead.appendChild(th);
+  }
+  attachSortHandlers();
+
+  // body — clickable rows with drilldown expansion
+  const tbody = document.querySelector('#t-projects tbody');
+  clear(tbody);
+  for (const p of rows) {
+    const tr = document.createElement('tr');
+    tr.style.cursor = 'pointer';
+    tr.addEventListener('click', () => {
+      state.expandedProject = state.expandedProject === p.name ? null : p.name;
+      render();
+    });
+    if (state.expandedProject === p.name) tr.style.background = 'var(--panel2)';
+    for (const c of activeCols) {
+      const td = document.createElement('td');
+      const v = c.render(p);
+      if (v && v.nodeType) td.appendChild(v);
+      else if (c.num) { td.className = 'num'; td.textContent = v == null ? '' : String(v); }
+      else td.textContent = v == null ? '' : String(v);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+
+    if (state.expandedProject === p.name) {
+      const detailTr = document.createElement('tr');
+      const detailTd = document.createElement('td');
+      detailTd.colSpan = activeCols.length;
+      detailTd.style.padding = '12px';
+      detailTd.style.background = 'var(--panel2)';
+      detailTd.appendChild(buildProjectDrilldown(p, f));
+      detailTr.appendChild(detailTd);
+      tbody.appendChild(detailTr);
+      // create charts AFTER canvases are in DOM
+      const mp = getMergedProject(p.name);
+      makeChart('ch-drill-hour', {
+        type:'bar',
+        data:{
+          labels: Array.from({length:24}, (_,i)=>String(i).padStart(2,'0')),
+          datasets:[{label:'Active hours', data: mp.by_hour.map(s=>s/3600), backgroundColor:C_ACCENT}]
+        },
+        options: gridOpts(),
+      });
+      makeChart('ch-drill-weekday', {
+        type:'bar',
+        data:{
+          labels: ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'],
+          datasets:[{label:'Active hours', data: mp.by_weekday.map(s=>s/3600), backgroundColor:C_GOOD}]
+        },
+        options: gridOpts(),
+      });
+    }
+  }
+}
+
+function buildProjectDrilldown(p, f) {
+  const wrap = el('div');
+  const title = el('h2', {style:'margin:0 0 12px;color:var(--accent);font-size:14px;font-weight:600;text-transform:none;letter-spacing:0'}, p.name);
+  wrap.appendChild(title);
+
+  // summary stats line
+  const stats = el('div', {style:'color:var(--muted);font-size:12px;margin-bottom:12px'},
+    'Active: ' + fmtHMS(p.active_sec) +
+    ' · Union: ' + fmtHMS(p.union_sec || 0) +
+    ' · Parallel: ' + (p.parallelism ? p.parallelism.toFixed(2)+'×' : '—') +
+    ' · Sessions: ' + fmtInt(p.sessions) +
+    ' · Cost: ' + fmtUSD(p.cost)
+  );
+  wrap.appendChild(stats);
+
+  // two charts side by side
+  const grid = el('div', {class:'grid-2'},
+    el('div', {class:'panel'},
+      el('h2', null, 'By hour of day (scan TZ)'),
+      el('div', {class:'chart-wrap'}, el('canvas', {id:'ch-drill-hour'}))
+    ),
+    el('div', {class:'panel'},
+      el('h2', null, 'By weekday'),
+      el('div', {class:'chart-wrap'}, el('canvas', {id:'ch-drill-weekday'}))
+    ),
+  );
+  wrap.appendChild(grid);
+
+  const mp = getMergedProject(p.name);
+
+  // skills + tools side by side
+  const skillsArr = Object.entries(mp.by_skill).sort((a,b)=>b[1]-a[1]).slice(0,15);
+  const toolsArr = Object.entries(mp.by_tool).sort((a,b)=>b[1]-a[1]).slice(0,15);
+  if (skillsArr.length > 0 || toolsArr.length > 0) {
+    const twoCol = el('div', {class:'grid-2', style:'margin-top:12px'});
+
+    if (skillsArr.length > 0) {
+      const skillPanel = el('div', {class:'panel'});
+      skillPanel.appendChild(el('h2', null, 'Top skills (this project)'));
+      const skTable = el('table');
+      skTable.appendChild(el('thead', null, el('tr', null,
+        el('th', null, 'Skill'),
+        el('th', {class:'num'}, 'Msgs')
+      )));
+      const skBody = el('tbody');
+      for (const [s, c] of skillsArr) {
+        skBody.appendChild(el('tr', null, el('td', null, s), el('td', {class:'num'}, fmtInt(c))));
+      }
+      skTable.appendChild(skBody);
+      skillPanel.appendChild(skTable);
+      twoCol.appendChild(skillPanel);
+    }
+
+    if (toolsArr.length > 0) {
+      const toolPanel = el('div', {class:'panel'});
+      toolPanel.appendChild(el('h2', null, 'Top tools (this project)'));
+      const tTable = el('table');
+      tTable.appendChild(el('thead', null, el('tr', null,
+        el('th', null, 'Tool'),
+        el('th', {class:'num'}, 'Uses')
+      )));
+      const tBody = el('tbody');
+      for (const [s, c] of toolsArr) {
+        tBody.appendChild(el('tr', null, el('td', null, s), el('td', {class:'num'}, fmtInt(c))));
+      }
+      tTable.appendChild(tBody);
+      toolPanel.appendChild(tTable);
+      twoCol.appendChild(toolPanel);
+    }
+
+    wrap.appendChild(twoCol);
+  }
+
+  // sessions for this project (in filter)
+  const projSessions = f.sessions_list.filter(s => s.project === p.name);
+  const sessPanel = el('div', {class:'panel', style:'margin-top:12px'});
+  sessPanel.appendChild(el('h2', null, 'Sessions (' + fmtInt(projSessions.length) + ', filtered)'));
+  const scroll = el('div', {style:'overflow:auto;max-height:300px'});
+  const sTable = el('table');
+  sTable.appendChild(el('thead', null, el('tr', null,
+    el('th', null, 'Start'),
+    el('th', null, 'Title'),
+    el('th', {class:'num'}, 'Active'),
+    el('th', {class:'num'}, 'Total'),
+    el('th', {class:'num'}, 'Msgs'),
+    el('th', {class:'num'}, 'Tokens'),
+    el('th', {class:'num'}, 'Cost'),
+    el('th', null, 'Models'),
+  )));
+  const sBody = el('tbody');
+  for (const s of projSessions.slice(0,200)) {
+    const tags = el('span');
+    for (const m of (s.models||[])) {
+      tags.appendChild(el('span', {class:'tag'}, m));
+    }
+    const titleCell = el('td', null, s.title || el('span', {class:'muted'}, s.session_id.slice(0,8)));
+    sBody.appendChild(el('tr', null,
+      el('td', null, fmtTime(s.start)),
+      titleCell,
+      el('td', {class:'num'}, fmtHMS(s.active_sec)),
+      el('td', {class:'num'}, fmtHMS(s.total_sec)),
+      el('td', {class:'num'}, fmtInt(s.messages)),
+      el('td', {class:'num'}, fmtTok(totalTokens(s.tokens))),
+      el('td', {class:'num'}, fmtUSD(s.cost_usd)),
+      el('td', null, tags),
+    ));
+  }
+  if (projSessions.length > 200) {
+    sBody.appendChild(el('tr', null,
+      el('td', {colspan:'8', class:'muted', style:'text-align:center'},
+        '… ' + (projSessions.length-200) + ' more rows hidden')
+    ));
+  }
+  sTable.appendChild(sBody);
+  scroll.appendChild(sTable);
+  sessPanel.appendChild(scroll);
+  wrap.appendChild(sessPanel);
+
+  return wrap;
+}
+
+function renderColumnToggles() {
+  const wrap = document.getElementById('proj-col-toggles');
+  clear(wrap);
+  for (const c of PROJ_COLS) {
+    const cb = el('input', {type:'checkbox'});
+    cb.checked = state.projCols.has(c.key);
+    cb.addEventListener('change', e => {
+      if (e.target.checked) state.projCols.add(c.key);
+      else state.projCols.delete(c.key);
+      render();
+    });
+    const lbl = el('label', {class:'col-toggle'}, cb, document.createTextNode(' '+c.label));
+    if (c.hint) lbl.setAttribute('data-hint', c.hint);
+    wrap.appendChild(lbl);
+  }
+}
+
+function attachSortHandlers() {
+  document.querySelectorAll('#t-projects thead th[data-sort]').forEach(th => {
+    th.style.cursor = 'pointer';
+    th.addEventListener('click', () => {
+      const k = th.getAttribute('data-sort');
+      if (state.projSort.key === k) state.projSort.dir *= -1;
+      else { state.projSort.key = k; state.projSort.dir = (k === 'name' || k === 'first' || k === 'last') ? 1 : -1; }
+      render();
+    });
+  });
+}
+
+function renderCards(f) {
+  const tot = totalTokens(f.tokens);
+  const cacheDenom = Math.max(1, (f.tokens.cache_read + f.tokens.cache_create_5m + f.tokens.cache_create_1h + f.tokens.input));
+  const cacheHit = f.tokens.cache_read / cacheDenom;
+  const avgH = f.active / 3600 / f.days;
+  const unionSec = f.union || 0;
+  const parallelism = unionSec > 0 ? f.active / unionSec : 0;
+  const overlapPct = f.active > 0 ? (1 - unionSec / f.active) * 100 : 0;
+  const cards = [
+    ['Active (sum)', fmtH(f.active)+' h', 'parallel sessions double-counted'],
+    ['Active (union)', fmtH(unionSec)+' h', 'wall-clock, real attention'],
+    ['Parallelism', parallelism.toFixed(2)+'×', overlapPct.toFixed(0)+'% of sum is overlap'],
+    ['Avg / day', avgH.toFixed(2)+' h', f.days+' days'],
+    ['Sessions', f.sessions.toLocaleString(), f.messages.toLocaleString()+' msgs'],
+    ['Tokens', fmtTok(tot), 'in '+fmtTok(f.tokens.input)+' · out '+fmtTok(f.tokens.output)],
+    ['Cache hit', (cacheHit*100).toFixed(1)+'%', 'read '+fmtTok(f.tokens.cache_read)],
+    ['Cost (est.)', fmtUSD(f.cost), '~'+fmtUSD(f.cost/Math.max(1,f.days))+' / day'],
+  ];
+  const c = document.getElementById('summary-cards');
+  clear(c);
+  for (const [label, val, sub] of cards) {
+    c.appendChild(el('div', {class:'card'},
+      el('div', {class:'label'}, label),
+      el('div', {class:'val'}, val),
+      el('div', {class:'sub'}, sub),
+    ));
+  }
+}
+
+function makeChart(id, cfg) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(document.getElementById(id), cfg);
+}
+
+const C_ACCENT = '#7c9eff', C_ACCENT2 = '#a978ff', C_GOOD = '#5dd39e';
+const C_GRID = '#242a37', C_TEXT = '#8a93a6';
+
+function gridOpts() {
+  return {
+    scales: {
+      x: {ticks:{color:C_TEXT}, grid:{color:C_GRID, drawBorder:false}},
+      y: {ticks:{color:C_TEXT}, grid:{color:C_GRID, drawBorder:false}, beginAtZero:true},
+    },
+    plugins:{legend:{labels:{color:C_TEXT}}},
+    maintainAspectRatio:false,
+  };
+}
+
+function renderDaily(f) {
+  makeChart('ch-daily', {
+    data:{
+      labels: f.daily.map(d=>d.date),
+      datasets:[
+        {type:'bar', label:'Sum (attribution)', data: f.daily.map(d=>d.active_sec/3600), backgroundColor:C_ACCENT, order:2},
+        {type:'line', label:'Union (wall-clock, all projects)', data: f.daily.map(d=>d.active_sec_union/3600), borderColor:C_ACCENT2, backgroundColor:C_ACCENT2, pointRadius:2, tension:0.2, order:1},
+      ]
+    },
+    options: gridOpts(),
+  });
+}
+
+function renderHour(f) {
+  makeChart('ch-hour', {
+    type:'bar',
+    data:{
+      labels: DATA.by_hour.map(h => String(h.hour).padStart(2,'0')),
+      datasets:[{label:'Messages (all data)', data: DATA.by_hour.map(h=>h.messages), backgroundColor:C_ACCENT2}]
+    },
+    options: gridOpts(),
+  });
+}
+
+function renderWeekday(f) {
+  makeChart('ch-weekday', {
+    type:'bar',
+    data:{
+      labels: DATA.by_weekday.map(w=>w.name),
+      datasets:[{label:'Messages (all data)', data: DATA.by_weekday.map(w=>w.messages), backgroundColor:C_GOOD}]
+    },
+    options: gridOpts(),
+  });
+}
+
+function renderProjects(f) {
+  const map = {};
+  for (const s of f.sessions_list) {
+    map[s.project] = (map[s.project] || 0) + s.active_sec;
+  }
+  const arr = Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,15);
+  makeChart('ch-projects', {
+    type:'bar',
+    data:{
+      labels: arr.map(x=>x[0]),
+      datasets:[{label:'Active hours', data: arr.map(x=>x[1]/3600), backgroundColor:C_ACCENT}]
+    },
+    options: {...gridOpts(), indexAxis:'y'},
+  });
+}
+
+function fillTable(tbodySel, rows, cellFns) {
+  const tbody = document.querySelector(tbodySel);
+  clear(tbody);
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    for (const fn of cellFns) {
+      const td = document.createElement('td');
+      const v = fn(r);
+      if (v && v.nodeType) { td.appendChild(v); }
+      else if (Array.isArray(v)) { td.className = v[1] || ''; td.textContent = v[0] == null ? '' : String(v[0]); }
+      else { td.textContent = v == null ? '' : String(v); }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+}
+
+function renderModel(f) {
+  fillTable('#t-model tbody', DATA.by_model, [
+    m => m.name,
+    m => [m.messages.toLocaleString(), 'num'],
+    m => [fmtTok(totalTokens(m.tokens)), 'num'],
+    m => [fmtUSD(m.cost_usd), 'num'],
+  ]);
+}
+
+function renderSkill(f) {
+  fillTable('#t-skill tbody', DATA.by_skill.slice(0,20), [
+    s => s.name,
+    s => [s.messages, 'num'],
+    s => [fmtTok(totalTokens(s.tokens)), 'num'],
+  ]);
+}
+
+function exportFiltered() {
+  const f = computeFiltered();
+  const blob = new Blob([JSON.stringify(f, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'cc-stats-filtered-' + state.from + '_' + state.to + '.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+init();
+</script>
+</body>
+</html>

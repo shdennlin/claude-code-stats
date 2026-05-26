@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Regenerate the anonymized demo report committed at docs/index.html.
+# Run from repo root. Requires the release binary already built.
+#
+# Setup:
+#   cp scripts/regen-demo.sh.example scripts/regen-demo.sh
+#   chmod +x scripts/regen-demo.sh
+#   # then edit the --merge rules below for YOUR project paths
+#
+# scripts/regen-demo.sh is .gitignored to keep your local project paths private.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+if [[ ! -x target/release/cc-stats ]]; then
+  echo "Building release binary…" >&2
+  cargo build --release
+fi
+
+# --anonymize strips PII (session.file, project.cwd, session titles, branch names).
+# Add --merge rules below to collapse multiple paths into a single anonymized label.
+# Example placeholder rules — replace with your own project path substrings:
+./target/release/cc-stats --all \
+  --anonymize \
+  --merge "myproject1=Project-A" \
+  --merge "myproject2=Project-B" \
+  --merge "vault=Personal-Vault" \
+  --merge "blog=Blog" \
+  -o docs/anon-out
+
+cp docs/anon-out/report.html docs/index.html
+echo "Wrote docs/index.html ($(du -h docs/index.html | cut -f1))"
+echo "Open: open docs/index.html"
