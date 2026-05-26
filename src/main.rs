@@ -539,8 +539,10 @@ fn anonymize_report(r: &mut Report) {
         p.cwd = None;
     }
     // branches: keep universal names (main/master/develop/HEAD), anonymize the rest
-    let universal: std::collections::HashSet<&str> =
-        ["main", "master", "develop", "HEAD", ""].iter().copied().collect();
+    let universal: std::collections::HashSet<&str> = ["main", "master", "develop", "HEAD", ""]
+        .iter()
+        .copied()
+        .collect();
     let mut branch_counter = 0u64;
     for b in &mut r.by_branch {
         if !universal.contains(b.name.as_str()) {
