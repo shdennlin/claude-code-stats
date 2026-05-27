@@ -147,11 +147,11 @@
 
   <section class="grid-2">
     <div class="panel">
-      <h2>By hour of day (scan TZ)</h2>
+      <h2>By hour of day (scan TZ) <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
       <div class="chart-wrap"><canvas id="ch-hour"></canvas></div>
     </div>
     <div class="panel">
-      <h2>By weekday</h2>
+      <h2>By weekday <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
       <div class="chart-wrap"><canvas id="ch-weekday"></canvas></div>
     </div>
   </section>
@@ -179,7 +179,7 @@
 
   <section class="grid-2">
     <div class="panel">
-      <h2>By model</h2>
+      <h2>By model <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
       <table id="t-model">
         <thead><tr>
           <th>Model</th><th class="num">Msgs</th><th class="num">Tokens</th><th class="num">Cost</th>
@@ -188,10 +188,10 @@
       </table>
     </div>
     <div class="panel">
-      <h2>Top skills</h2>
+      <h2>Top skills <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
       <table id="t-skill">
         <thead><tr>
-          <th>Skill</th><th class="num">Msgs</th><th class="num">Tokens</th>
+          <th>Skill</th><th class="num">Msgs</th>
         </tr></thead>
         <tbody></tbody>
       </table>
@@ -200,14 +200,14 @@
 
   <section class="grid-2">
     <div class="panel">
-      <h2>Top tools</h2>
+      <h2>Top tools <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
       <table id="t-tool">
         <thead><tr><th>Tool</th><th class="num">Uses</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
     <div class="panel">
-      <h2>MCP servers</h2>
+      <h2>MCP servers <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
       <table id="t-mcp">
         <thead><tr><th>Server</th><th class="num">Tool calls</th></tr></thead>
         <tbody></tbody>
@@ -217,14 +217,14 @@
 
   <section class="grid-2">
     <div class="panel">
-      <h2>Content composition</h2>
+      <h2>Content composition <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
       <table id="t-content">
         <thead><tr><th>Block type</th><th class="num">Count</th><th class="num">Share</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
     <div class="panel">
-      <h2>Stop reason</h2>
+      <h2>Stop reason <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
       <table id="t-stop">
         <thead><tr><th>Reason</th><th class="num">Count</th><th class="num">Share</th></tr></thead>
         <tbody></tbody>
@@ -255,7 +255,7 @@
   </section>
 
   <section class="panel">
-    <h2>Top git branches</h2>
+    <h2>Top git branches <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
     <table id="t-branch">
       <thead><tr>
         <th>Branch</th>
@@ -1068,27 +1068,46 @@ function renderSessionLogToggles() {
   }
 }
 
+function aggCounts(f, field) {
+  const counts = {};
+  for (const s of f.sessions_list) {
+    const m = s[field];
+    if (!m) continue;
+    for (const [k, n] of Object.entries(m)) counts[k] = (counts[k] || 0) + n;
+  }
+  return counts;
+}
+
 function renderTool(f) {
-  fillTable('#t-tool tbody', DATA.by_tool.slice(0, 25), [
+  const counts = aggCounts(f, 'by_tool');
+  const rows = Object.entries(counts)
+    .map(([name, count]) => ({name, count}))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 25);
+  fillTable('#t-tool tbody', rows, [
     t => t.name,
     t => [fmtInt(t.count), 'num'],
   ]);
 }
 
 function renderMcp(f) {
-  if (!DATA.by_mcp_server.length) {
-    document.querySelector('#t-mcp tbody').innerHTML = '';
-    return;
-  }
-  fillTable('#t-mcp tbody', DATA.by_mcp_server, [
+  const counts = aggCounts(f, 'by_mcp_server');
+  const rows = Object.entries(counts)
+    .map(([name, count]) => ({name, count}))
+    .sort((a, b) => b.count - a.count);
+  fillTable('#t-mcp tbody', rows, [
     m => m.name,
     m => [fmtInt(m.count), 'num'],
   ]);
 }
 
 function renderContent(f) {
-  const total = DATA.by_content_type.reduce((s,c) => s+c.count, 0) || 1;
-  fillTable('#t-content tbody', DATA.by_content_type, [
+  const counts = aggCounts(f, 'by_content_type');
+  const rows = Object.entries(counts)
+    .map(([name, count]) => ({name, count}))
+    .sort((a, b) => b.count - a.count);
+  const total = rows.reduce((s,c) => s+c.count, 0) || 1;
+  fillTable('#t-content tbody', rows, [
     c => c.name,
     c => [fmtInt(c.count), 'num'],
     c => [(c.count/total*100).toFixed(1)+'%', 'num'],
@@ -1096,8 +1115,12 @@ function renderContent(f) {
 }
 
 function renderStop(f) {
-  const total = DATA.by_stop_reason.reduce((s,c) => s+c.count, 0) || 1;
-  fillTable('#t-stop tbody', DATA.by_stop_reason, [
+  const counts = aggCounts(f, 'by_stop_reason');
+  const rows = Object.entries(counts)
+    .map(([name, count]) => ({name, count}))
+    .sort((a, b) => b.count - a.count);
+  const total = rows.reduce((s,c) => s+c.count, 0) || 1;
+  fillTable('#t-stop tbody', rows, [
     c => c.name,
     c => [fmtInt(c.count), 'num'],
     c => [(c.count/total*100).toFixed(1)+'%', 'num'],
@@ -1105,13 +1128,26 @@ function renderStop(f) {
 }
 
 function renderBranch(f) {
-  fillTable('#t-branch tbody', DATA.by_branch.slice(0, 25), [
+  const map = new Map();
+  for (const s of f.sessions_list) {
+    for (const [name, attr] of Object.entries(s.by_branch || {})) {
+      let b = map.get(name);
+      if (!b) { b = {name, active_sec:0, sessions:0, messages:0, tokens_total:0, cost:0}; map.set(name, b); }
+      b.active_sec += attr.active_sec || 0;
+      b.messages   += attr.messages   || 0;
+      b.tokens_total += totalTokens(attr.tokens);
+      b.cost       += attr.cost_usd   || 0;
+      b.sessions   += 1;
+    }
+  }
+  const rows = Array.from(map.values()).sort((a,b) => b.active_sec - a.active_sec).slice(0, 25);
+  fillTable('#t-branch tbody', rows, [
     b => b.name,
     b => [fmtHMS(b.active_sec), 'num'],
     b => [fmtInt(b.sessions), 'num'],
     b => [fmtInt(b.messages), 'num'],
-    b => [fmtTok(b.tokens.input + b.tokens.output + b.tokens.cache_create_5m + b.tokens.cache_create_1h + b.tokens.cache_read), 'num'],
-    b => [fmtUSD(b.cost_usd), 'num'],
+    b => [fmtTok(b.tokens_total), 'num'],
+    b => [fmtUSD(b.cost), 'num'],
   ]);
 }
 
@@ -1502,22 +1538,33 @@ function renderDaily(f) {
 }
 
 function renderHour(f) {
+  const hours = new Array(24).fill(0);
+  for (const s of f.sessions_list) {
+    const arr = s.by_hour || [];
+    for (let i = 0; i < 24; i++) hours[i] += (arr[i] || 0);
+  }
   makeChart('ch-hour', {
     type:'bar',
     data:{
-      labels: DATA.by_hour.map(h => String(h.hour).padStart(2,'0')),
-      datasets:[{label:'Messages (all data)', data: DATA.by_hour.map(h=>h.messages), backgroundColor:C_ACCENT2}]
+      labels: hours.map((_, i) => String(i).padStart(2,'0')),
+      datasets:[{label:'Active hours (filtered)', data: hours.map(s => s/3600), backgroundColor:C_ACCENT2}]
     },
     options: gridOpts(),
   });
 }
 
+const WEEKDAY_NAMES = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 function renderWeekday(f) {
+  const days = new Array(7).fill(0);
+  for (const s of f.sessions_list) {
+    const arr = s.by_weekday || [];
+    for (let i = 0; i < 7; i++) days[i] += (arr[i] || 0);
+  }
   makeChart('ch-weekday', {
     type:'bar',
     data:{
-      labels: DATA.by_weekday.map(w=>w.name),
-      datasets:[{label:'Messages (all data)', data: DATA.by_weekday.map(w=>w.messages), backgroundColor:C_GOOD}]
+      labels: WEEKDAY_NAMES,
+      datasets:[{label:'Active hours (filtered)', data: days.map(s => s/3600), backgroundColor:C_GOOD}]
     },
     options: gridOpts(),
   });
@@ -1557,19 +1604,39 @@ function fillTable(tbodySel, rows, cellFns) {
 }
 
 function renderModel(f) {
-  fillTable('#t-model tbody', DATA.by_model, [
+  const map = new Map();
+  for (const s of f.sessions_list) {
+    for (const [name, attr] of Object.entries(s.by_model || {})) {
+      let m = map.get(name);
+      if (!m) { m = {name, messages:0, tokens:0, cost:0}; map.set(name, m); }
+      m.messages += attr.messages || 0;
+      m.tokens   += totalTokens(attr.tokens);
+      m.cost     += attr.cost_usd || 0;
+    }
+  }
+  const rows = Array.from(map.values()).sort((a,b) => b.tokens - a.tokens);
+  fillTable('#t-model tbody', rows, [
     m => m.name,
-    m => [m.messages.toLocaleString(), 'num'],
-    m => [fmtTok(totalTokens(m.tokens)), 'num'],
-    m => [fmtUSD(m.cost_usd), 'num'],
+    m => [fmtInt(m.messages), 'num'],
+    m => [fmtTok(m.tokens), 'num'],
+    m => [fmtUSD(m.cost), 'num'],
   ]);
 }
 
 function renderSkill(f) {
-  fillTable('#t-skill tbody', DATA.by_skill.slice(0,20), [
+  const counts = {};
+  for (const s of f.sessions_list) {
+    for (const [skill, n] of Object.entries(s.by_skill || {})) {
+      counts[skill] = (counts[skill] || 0) + n;
+    }
+  }
+  const rows = Object.entries(counts)
+    .map(([name, messages]) => ({name, messages}))
+    .sort((a, b) => b.messages - a.messages)
+    .slice(0, 20);
+  fillTable('#t-skill tbody', rows, [
     s => s.name,
-    s => [s.messages, 'num'],
-    s => [fmtTok(totalTokens(s.tokens)), 'num'],
+    s => [fmtInt(s.messages), 'num'],
   ]);
 }
 

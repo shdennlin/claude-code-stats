@@ -221,6 +221,21 @@ struct ProjectStat {
     by_tool: BTreeMap<String, u64>,  // tool name -> count
 }
 
+#[derive(Debug, Default, Serialize, Clone)]
+struct SessionModelAttr {
+    messages: u64,
+    tokens: Tokens,
+    cost_usd: f64,
+}
+
+#[derive(Debug, Default, Serialize, Clone)]
+struct SessionBranchAttr {
+    active_sec: u64,
+    messages: u64,
+    tokens: Tokens,
+    cost_usd: f64,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct SessionStat {
     project: String,
@@ -235,6 +250,15 @@ struct SessionStat {
     tokens: Tokens,
     cost_usd: f64,
     models: Vec<String>,
+    by_hour: Vec<u64>,                              // 24, active_sec
+    by_weekday: Vec<u64>,                           // 7, active_sec
+    by_skill: BTreeMap<String, u64>,                // skill -> messages
+    by_tool: BTreeMap<String, u64>,                 // tool -> uses
+    by_mcp_server: BTreeMap<String, u64>,           // mcp server -> uses
+    by_content_type: BTreeMap<String, u64>,         // type -> count
+    by_stop_reason: BTreeMap<String, u64>,          // reason -> count
+    by_branch: BTreeMap<String, SessionBranchAttr>, // branch -> {active_sec, msgs, tokens, cost}
+    by_model: BTreeMap<String, SessionModelAttr>,   // model -> {msgs, tokens, cost}
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
@@ -702,6 +726,10 @@ fn run() -> Result<()> {
             let mut sess_by_skill: BTreeMap<String, u64> = BTreeMap::new();
             let mut sess_by_tool: BTreeMap<String, u64> = BTreeMap::new();
             let mut sess_by_branch: BTreeMap<String, (u64, u64, Tokens, f64)> = BTreeMap::new();
+            let mut sess_by_mcp: BTreeMap<String, u64> = BTreeMap::new();
+            let mut sess_by_content: BTreeMap<String, u64> = BTreeMap::new();
+            let mut sess_by_stop: BTreeMap<String, u64> = BTreeMap::new();
+            let mut sess_by_model_attr: BTreeMap<String, SessionModelAttr> = BTreeMap::new();
 
             for (a, b) in events.iter().zip(events.iter().skip(1)) {
                 let gap = (b.dt_utc - a.dt_utc).num_seconds().max(0) as u64;
@@ -767,6 +795,10 @@ fn run() -> Result<()> {
                     ms.messages += 1;
                     ms.tokens.add(&e.tokens);
                     ms.cost_usd += c;
+                    let sm = sess_by_model_attr.entry(m.clone()).or_default();
+                    sm.messages += 1;
+                    sm.tokens.add(&e.tokens);
+                    sm.cost_usd += c;
                 }
                 if let Some(s) = &e.skill {
                     let ns = by_skill.entry(s.clone()).or_insert_with(|| NamedStat {
@@ -794,15 +826,18 @@ fn run() -> Result<()> {
                     if let Some(rest) = tool.strip_prefix("mcp__") {
                         let server = rest.split("__").next().unwrap_or("").to_string();
                         if !server.is_empty() {
-                            *by_mcp_server.entry(server).or_insert(0) += 1;
+                            *by_mcp_server.entry(server.clone()).or_insert(0) += 1;
+                            *sess_by_mcp.entry(server).or_insert(0) += 1;
                         }
                     }
                 }
                 for ct in &e.content_types {
                     *by_content.entry(ct.clone()).or_insert(0) += 1;
+                    *sess_by_content.entry(ct.clone()).or_insert(0) += 1;
                 }
                 if let Some(sr) = &e.stop_reason {
                     *by_stop_reason.entry(sr.clone()).or_insert(0) += 1;
+                    *sess_by_stop.entry(sr.clone()).or_insert(0) += 1;
                 }
                 if let Some(br) = &e.git_branch {
                     let entry = sess_by_branch
@@ -848,6 +883,20 @@ fn run() -> Result<()> {
                 .custom_title
                 .clone()
                 .or_else(|| sess_meta.ai_title.clone());
+            let sess_by_branch_serial: BTreeMap<String, SessionBranchAttr> = sess_by_branch
+                .iter()
+                .map(|(k, (a_sec, msgs, tks, cst))| {
+                    (
+                        k.clone(),
+                        SessionBranchAttr {
+                            active_sec: *a_sec,
+                            messages: *msgs,
+                            tokens: tks.clone(),
+                            cost_usd: *cst,
+                        },
+                    )
+                })
+                .collect();
             sessions.push(SessionStat {
                 project: project_name.clone(),
                 session_id,
@@ -861,6 +910,15 @@ fn run() -> Result<()> {
                 tokens: sess_tokens,
                 cost_usd: sess_cost,
                 models: sess_models.into_keys().collect(),
+                by_hour: sess_by_hour.to_vec(),
+                by_weekday: sess_by_weekday.to_vec(),
+                by_skill: sess_by_skill.clone(),
+                by_tool: sess_by_tool.clone(),
+                by_mcp_server: sess_by_mcp,
+                by_content_type: sess_by_content,
+                by_stop_reason: sess_by_stop,
+                by_branch: sess_by_branch_serial,
+                by_model: sess_by_model_attr,
             });
 
             // project aggregate
