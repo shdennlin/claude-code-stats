@@ -125,7 +125,15 @@
         <div class="rule-list" id="merge-list"></div>
       </div>
       <div class="field" style="grid-column: 1 / -1">
-        <label>Projects (all selected by default; counts reflect date filter)</label>
+        <label>Omit projects (substring patterns — matched projects are hidden everywhere)</label>
+        <div class="rule-row">
+          <input type="text" id="omit-pattern" placeholder="pattern (substring of project path or label)">
+          <button id="btn-add-omit" style="width:auto;padding:6px 12px">Add</button>
+        </div>
+        <div class="rule-list" id="omit-list"></div>
+      </div>
+      <div class="field" style="grid-column: 1 / -1">
+        <label>Projects (counts reflect date filter; selection sticky across date changes)</label>
         <div class="projects-list" id="projects-list"></div>
       </div>
     </div>
@@ -300,7 +308,9 @@ function saveState() {
       from: state.from,
       to: state.to,
       projects: Array.from(state.projects),
+      allSelected: state.allSelected,
       mergeRules: state.mergeRules,
+      omitRules: state.omitRules,
       displayTz: state.displayTz,
       projSort: state.projSort,
       projCols: Array.from(state.projCols),
@@ -324,6 +334,8 @@ function loadState() {
     if (s.from) state.from = clampDate(s.from);
     if (s.to) state.to = clampDate(s.to);
     if (Array.isArray(s.mergeRules)) state.mergeRules = s.mergeRules;
+    if (Array.isArray(s.omitRules)) state.omitRules = s.omitRules;
+    if (typeof s.allSelected === 'boolean') state.allSelected = s.allSelected;
     if (s.displayTz) state.displayTz = s.displayTz;
     if (s.projSort) state.projSort = s.projSort;
     if (Array.isArray(s.projCols)) state.projCols = new Set(s.projCols);
@@ -484,7 +496,9 @@ const PROJ_COLS = [
 const state = {
   from: null, to: null,
   projects: new Set(),   // selected merged-project labels
+  allSelected: true,     // sticky: when true, rebuild() auto-selects every project in range
   mergeRules: [],        // [{pattern, label}]
+  omitRules: [],         // [pattern, ...] — substrings; projects matching are hidden everywhere
   displayTz: 'scan',     // 'scan' | 'local' | 'utc'
   projSort: {key: 'active_sec', dir: -1},
   projCols: new Set(PROJ_COLS.filter(c => c.on).map(c => c.key)),
@@ -546,6 +560,15 @@ function el(tag, attrs, ...children) {
   return e;
 }
 function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+function isOmitted(name) {
+  if (!state.omitRules.length) return false;
+  const lower = name.toLowerCase();
+  for (const p of state.omitRules) {
+    if (p && lower.indexOf(p.toLowerCase()) !== -1) return true;
+  }
+  return false;
+}
 
 function applyMerge(name) {
   const lower = name.toLowerCase();
@@ -624,9 +647,12 @@ function init() {
   document.getElementById('btn-reset').addEventListener('click', resetFilters);
   document.getElementById('btn-export').addEventListener('click', exportFiltered);
   document.getElementById('btn-add-merge').addEventListener('click', addMergeRule);
+  document.getElementById('btn-add-omit').addEventListener('click', addOmitRule);
   document.getElementById('btn-clear-storage').addEventListener('click', clearStorage);
   document.getElementById('merge-label').addEventListener('keydown', e => { if (e.key === 'Enter') addMergeRule(); });
   document.getElementById('merge-pattern').addEventListener('keydown', e => { if (e.key === 'Enter') addMergeRule(); });
+  document.getElementById('omit-pattern').addEventListener('keydown', e => { if (e.key === 'Enter') addOmitRule(); });
+  renderOmitList();
 
   renderColumnToggles();
   renderQuickButtons();
@@ -790,20 +816,54 @@ function renderMergeList() {
   });
 }
 
+function addOmitRule() {
+  const pat = document.getElementById('omit-pattern').value.trim();
+  if (!pat) return;
+  state.omitRules.push(pat);
+  document.getElementById('omit-pattern').value = '';
+  renderOmitList();
+  rebuild();
+}
+
+function removeOmitRule(idx) {
+  state.omitRules.splice(idx, 1);
+  renderOmitList();
+  rebuild();
+}
+
+function renderOmitList() {
+  const list = document.getElementById('omit-list');
+  if (!list) return;
+  clear(list);
+  state.omitRules.forEach((p, i) => {
+    const pill = el('div', {class:'rule-pill'},
+      el('span', null,
+        el('span', {class:'muted'}, 'omit '),
+        p,
+      ),
+      el('button', {onclick: () => removeOmitRule(i)}, '×')
+    );
+    list.appendChild(pill);
+  });
+}
+
 // ---------- rebuild (project list changes) ----------
 function rebuild() {
   const merged = mergedSessions();
   const projInRange = aggregateProjects(merged.sessions, state.from, state.to);
   const newSelected = new Set();
-  const prevHad = state.projects.size > 0;
-  for (const p of projInRange) {
-    if (!prevHad || state.projects.has(p.name)) newSelected.add(p.name);
-  }
-  // Guard: if user had a selection but nothing intersects (stale state or
-  // filter narrowed projects out), default to all in range instead of locking
-  // them out of seeing data.
-  if (prevHad && newSelected.size === 0 && projInRange.length > 0) {
+  if (state.allSelected) {
+    // sticky: keep every project in the new range selected
     for (const p of projInRange) newSelected.add(p.name);
+  } else {
+    const prevHad = state.projects.size > 0;
+    for (const p of projInRange) {
+      if (!prevHad || state.projects.has(p.name)) newSelected.add(p.name);
+    }
+    // Safety: prior selection had nothing intersecting the new range — fall back to all.
+    if (prevHad && newSelected.size === 0 && projInRange.length > 0) {
+      for (const p of projInRange) newSelected.add(p.name);
+    }
   }
   state.projects = newSelected;
   renderProjectList(projInRange);
@@ -811,19 +871,23 @@ function rebuild() {
 }
 
 function mergedSessions() {
-  const sessions = DATA.sessions.map(s => ({
-    ...s,
-    project: applyMerge(s.project),
-  }));
+  const sessions = DATA.sessions
+    .filter(s => !isOmitted(s.project))
+    .map(s => ({...s, project: applyMerge(s.project)}))
+    .filter(s => !isOmitted(s.project));
   const dailyByProj = DATA.daily.map(d => {
     const by = {};
     const byU = {};
     for (const [proj, sec] of Object.entries(d.by_project || {})) {
+      if (isOmitted(proj)) continue;
       const m = applyMerge(proj);
+      if (isOmitted(m)) continue;
       by[m] = (by[m] || 0) + sec;
     }
     for (const [proj, sec] of Object.entries(d.union_by_project || {})) {
+      if (isOmitted(proj)) continue;
       const m = applyMerge(proj);
+      if (isOmitted(m)) continue;
       // sum is an upper bound when sub-projects are merged
       byU[m] = (byU[m] || 0) + sec;
     }
@@ -876,6 +940,8 @@ function renderProjectList(projInRange) {
     cb.checked = state.projects.has(p.name);
     cb.addEventListener('change', (e) => {
       if (e.target.checked) state.projects.add(p.name); else state.projects.delete(p.name);
+      // sticky-all tracks whether every visible row is checked
+      state.allSelected = (state.projects.size === projInRange.length);
       render();
     });
     const row = el('label', null,
@@ -899,13 +965,17 @@ function selectAll(yes) {
     const merged = mergedSessions();
     for (const p of aggregateProjects(merged.sessions, state.from, state.to)) state.projects.add(p.name);
   }
+  state.allSelected = yes;
   render();
 }
 
 function resetFilters() {
   state.mergeRules = [];
+  state.omitRules = [];
+  state.allSelected = true;
   state.expandedProject = null;
   renderMergeList();
+  renderOmitList();
   // pick the preset that matches DATA.summary.default_window_days
   const w = DATA.summary.default_window_days || 0;
   let key = 'all';
