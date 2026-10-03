@@ -1,6 +1,6 @@
 BIN  := cc-stats
 TARGET := target/release/$(BIN)
-# Extra CLI args, e.g. `make run ARGS="--days 90 --open"`
+# Extra CLI args, e.g. `make run ARGS="--days 90"` (--open is always passed)
 ARGS ?=
 
 .DEFAULT_GOAL := help
@@ -8,13 +8,13 @@ ARGS ?=
 
 help: ## Show this help
 	@grep -E '^[a-z]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-8s %s\n", $$1, $$2}'
-	@echo '  (pass flags with ARGS="...", e.g. make run ARGS="--days 90 --open")'
+	@echo '  (pass flags with ARGS="...", e.g. make run ARGS="--days 90")'
 
 build: ## Build the release binary
 	cargo build --release
 
-run: build ## Build and run the binary
-	./$(TARGET) $(ARGS)
+run: build ## Build, run, and open the report
+	./$(TARGET) --open $(ARGS)
 
 test: ## Run unit tests
 	cargo test
