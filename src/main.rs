@@ -168,7 +168,9 @@ impl Tokens {
 fn pricing(model: &str) -> (f64, f64, f64, f64, f64) {
     // (input, output, cache_write_5m, cache_write_1h, cache_read)
     let m = model.to_lowercase();
-    if m.contains("opus") {
+    if m.contains("fable") || m.contains("fabel") {
+        (10.0, 50.0, 12.5, 20.0, 1.0)
+    } else if m.contains("opus") {
         (15.0, 75.0, 18.75, 30.0, 1.50)
     } else if m.contains("haiku") {
         (1.0, 5.0, 1.25, 2.0, 0.10)
@@ -187,6 +189,17 @@ fn cost_usd(t: &Tokens, model: &str) -> f64 {
         + t.cache_create_1h as f64 * c1
         + t.cache_read as f64 * cr)
         / 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pricing_recognizes_fable_models() {
+        assert_eq!(pricing("claude-fable-5"), (10.0, 50.0, 12.5, 20.0, 1.0));
+        assert_eq!(pricing("claude-fabel-5"), (10.0, 50.0, 12.5, 20.0, 1.0));
+    }
 }
 
 #[derive(Debug)]

@@ -119,6 +119,7 @@ The HTML viewer also supports merge rules interactively (no rerun needed) — us
 
 | Model  | input | output | cache_write_5m | cache_write_1h | cache_read |
 |---|---|---|---|---|---|
+| Fable  | 10 | 50 | 12.50 | 20 | 1.00 |
 | Opus   | 15 | 75 | 18.75 | 30 | 1.50 |
 | Sonnet | 3  | 15 | 3.75  | 6  | 0.30 |
 | Haiku  | 1  | 5  | 1.25  | 2  | 0.10 |
