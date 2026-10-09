@@ -871,7 +871,7 @@ function rebuild() {
 }
 
 function mergedSessions() {
-  const sessions = DATA.sessions
+  const sessions = (DATA.session_days || DATA.sessions)
     .filter(s => !isOmitted(s.project))
     .map(s => ({...s, project: applyMerge(s.project)}))
     .filter(s => !isOmitted(s.project));
@@ -918,11 +918,43 @@ function getMergedProject(name) {
   return merged;
 }
 
+// Recombine only the selected dates into one row per session. All panels use
+// these rows, so cards, project tables and model attribution share one window.
+function sessionsInRange(sessions, from, to) {
+  const map = new Map();
+  function addMetric(target, key, value) {
+    if (typeof value === 'number') target[key] = (target[key] || 0) + value;
+    else if (Array.isArray(value)) {
+      if (key === 'by_hour' || key === 'by_weekday') {
+        const old = target[key] || [];
+        target[key] = value.map((v, i) => v + (old[i] || 0));
+      } else target[key] = Array.from(new Set([...(target[key] || []), ...value]));
+    } else if (value && typeof value === 'object') {
+      if (!target[key]) target[key] = {};
+      for (const [k, v] of Object.entries(value)) addMetric(target[key], k, v);
+    }
+  }
+  for (const s of sessions) {
+    const date = s.date || isoToDateKey(s.start);
+    if (date < from || date > to) continue;
+    const key = s.file || s.project + '\0' + s.session_id;
+    let row = map.get(key);
+    if (!row) {
+      row = JSON.parse(JSON.stringify(s));
+      delete row.date;
+      map.set(key, row);
+    } else {
+      for (const [k, v] of Object.entries(s)) addMetric(row, k, v);
+      if (s.start < row.start) row.start = s.start;
+      if (s.end > row.end) row.end = s.end;
+    }
+  }
+  return Array.from(map.values());
+}
+
 function aggregateProjects(sessions, from, to) {
   const map = new Map();
-  for (const s of sessions) {
-    const d = isoToDateKey(s.start);
-    if (d < from || d > to) continue;
+  for (const s of sessionsInRange(sessions, from, to)) {
     let p = map.get(s.project);
     if (!p) { p = {name: s.project, active_sec: 0, sessions: 0, messages: 0}; map.set(s.project, p); }
     p.active_sec += s.active_sec;
@@ -997,10 +1029,8 @@ function computeFiltered() {
     tokens: {input:0, output:0, cache_create_5m:0, cache_create_1h:0, cache_read:0, iterations:0},
     days: 0,
   };
-  const sessions = merged.sessions.filter(s => {
-    const d = isoToDateKey(s.start);
-    return inRange(d) && state.projects.has(s.project);
-  });
+  const sessions = sessionsInRange(merged.sessions, state.from, state.to)
+    .filter(s => state.projects.has(s.project));
   f.sessions = sessions.length;
   for (const s of sessions) {
     f.active += s.active_sec;
@@ -1562,7 +1592,7 @@ function renderCards(f) {
     ['Sessions', f.sessions.toLocaleString(), f.messages.toLocaleString()+' msgs'],
     ['Tokens', fmtTok(tot), 'in '+fmtTok(f.tokens.input)+' · out '+fmtTok(f.tokens.output)],
     ['Cache hit', (cacheHit*100).toFixed(1)+'%', 'read '+fmtTok(f.tokens.cache_read)],
-    ['Cost (est.)', fmtUSD(f.cost), '~'+fmtUSD(f.cost/Math.max(1,f.days))+' / day'],
+    ['API cost (est.)', fmtUSD(f.cost), '~'+fmtUSD(f.cost/Math.max(1,f.days))+' / day'],
   ];
   const c = document.getElementById('summary-cards');
   clear(c);

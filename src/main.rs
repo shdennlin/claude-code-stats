@@ -227,20 +227,22 @@ fn usage_tokens(u: &Value) -> Tokens {
             .unwrap_or(0),
         ..Default::default()
     };
-    // split cache creation into 5m / 1h if available
-    if let Some(cc) = u.get("cache_creation") {
-        tokens.cache_create_5m = cc
-            .get("ephemeral_5m_input_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        tokens.cache_create_1h = cc
-            .get("ephemeral_1h_input_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
+    // Total writes are authoritative when present; derive the 5m remainder
+    // from the 1h split, including logs that omit the explicit 5m field.
+    let total_write = u.get("cache_creation_input_tokens").and_then(Value::as_u64);
+    let cc = u.get("cache_creation");
+    let one_hour = cc
+        .and_then(|v| v.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if let Some(total) = total_write {
+        tokens.cache_create_1h = one_hour.min(total);
+        tokens.cache_create_5m = total - tokens.cache_create_1h;
     } else {
-        tokens.cache_create_5m = u
-            .get("cache_creation_input_tokens")
-            .and_then(|x| x.as_u64())
+        tokens.cache_create_1h = one_hour;
+        tokens.cache_create_5m = cc
+            .and_then(|v| v.get("ephemeral_5m_input_tokens"))
+            .and_then(Value::as_u64)
             .unwrap_or(0);
     }
     tokens
@@ -436,6 +438,8 @@ mod tests {
 
 #[derive(Debug)]
 struct Event {
+    billing_key: Option<String>,
+    usage: Option<Value>,
     cost_usd: f64,
     dt_utc: DateTime<Utc>,
     model: Option<String>,
@@ -482,7 +486,7 @@ struct SessionBranchAttr {
     cost_usd: f64,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Default, Serialize, Clone)]
 struct SessionStat {
     project: String,
     session_id: String,
@@ -505,6 +509,238 @@ struct SessionStat {
     by_stop_reason: BTreeMap<String, u64>,          // reason -> count
     by_branch: BTreeMap<String, SessionBranchAttr>, // branch -> {active_sec, msgs, tokens, cost}
     by_model: BTreeMap<String, SessionModelAttr>,   // model -> {msgs, tokens, cost}
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SessionDay {
+    date: String,
+    #[serde(flatten)]
+    session: SessionStat,
+}
+
+// Retain every event for activity/tool metrics, but charge API usage only once.
+// Syrtis/tokscale-core uses message.id + requestId and per-field maxima.
+fn deduplicate_usage(sessions: &mut [(PathBuf, SessionMeta, Vec<Event>)]) {
+    let mut snapshots: BTreeMap<String, (usize, usize, Tokens, Value)> = BTreeMap::new();
+    for (si, (_, _, events)) in sessions.iter().enumerate() {
+        for (ei, e) in events.iter().enumerate() {
+            let (Some(key), Some(usage)) = (&e.billing_key, &e.usage) else {
+                continue;
+            };
+            let snapshot = snapshots
+                .entry(key.clone())
+                .or_insert_with(|| (si, ei, e.tokens, usage.clone()));
+            let first = &sessions[snapshot.0].2[snapshot.1];
+            if e.dt_utc < first.dt_utc {
+                snapshot.0 = si;
+                snapshot.1 = ei;
+            }
+            // Billing modifiers can arrive without increasing token counts.
+            // Preserve known values when a more complete usage omits them.
+            let modifiers: Vec<_> = ["speed", "inference_geo"]
+                .into_iter()
+                .filter_map(|key| {
+                    let valid = |value: &Value| {
+                        value
+                            .as_str()
+                            .filter(|v| match key {
+                                "speed" => matches!(*v, "fast" | "standard"),
+                                _ => matches!(*v, "us" | "global"),
+                            })
+                            .map(str::to_string)
+                    };
+                    usage
+                        .get(key)
+                        .and_then(valid)
+                        .or_else(|| snapshot.3.get(key).and_then(valid))
+                        .map(|value| (key, value))
+                })
+                .collect();
+            if e.tokens.output > snapshot.2.output {
+                snapshot.3 = usage.clone();
+            }
+            if let Some(object) = snapshot.3.as_object_mut() {
+                for (key, value) in modifiers {
+                    object.insert(key.to_string(), Value::String(value));
+                }
+            }
+            let t = &mut snapshot.2;
+            t.input = t.input.max(e.tokens.input);
+            t.output = t.output.max(e.tokens.output);
+            // Later snapshots can add TTL details without adding cache writes.
+            let cache_write_total = (t.cache_create_5m + t.cache_create_1h)
+                .max(e.tokens.cache_create_5m + e.tokens.cache_create_1h);
+            t.cache_create_1h = t
+                .cache_create_1h
+                .max(e.tokens.cache_create_1h)
+                .min(cache_write_total);
+            t.cache_create_5m = cache_write_total - t.cache_create_1h;
+            t.cache_read = t.cache_read.max(e.tokens.cache_read);
+            t.iterations = t.iterations.max(e.tokens.iterations);
+        }
+    }
+    for (_, _, events) in sessions.iter_mut() {
+        for e in events {
+            if e.billing_key.is_some() && e.usage.is_some() {
+                e.tokens = Tokens::default();
+                e.cost_usd = 0.0;
+            }
+        }
+    }
+    for (_, (si, ei, tokens, usage)) in snapshots {
+        let e = &mut sessions[si].2[ei];
+        e.tokens = tokens;
+        e.cost_usd = usage_cost_usd(&usage, e.model.as_deref().unwrap_or(""), &tokens);
+    }
+}
+
+// Split active intervals at hour boundaries, including midnight in scan TZ.
+fn active_intervals(
+    events: &[Event],
+    gap_sec: u64,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>, Option<String>)> {
+    let mut intervals = Vec::new();
+    for pair in events.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let gap = (b.dt_utc - a.dt_utc).num_seconds();
+        if gap <= 0 || gap as u64 > gap_sec {
+            continue;
+        }
+        // Work in whole seconds, matching the existing gap metric. Quantize
+        // once before splitting so two half-seconds across midnight don't vanish.
+        let mut start = Utc.timestamp_opt(a.dt_utc.timestamp(), 0).single().unwrap();
+        let interval_end = start + chrono::Duration::seconds(gap);
+        while start < interval_end {
+            let local = start.with_timezone(tz());
+            let hour_start = local
+                .with_minute(0)
+                .unwrap()
+                .with_second(0)
+                .unwrap()
+                .with_nanosecond(0)
+                .unwrap();
+            let next_hour = (hour_start + chrono::Duration::hours(1)).with_timezone(&Utc);
+            let end = interval_end.min(next_hour);
+            intervals.push((start, end, a.git_branch.clone()));
+            start = end;
+        }
+    }
+    intervals
+}
+
+fn build_session_days(
+    session: &SessionStat,
+    events: &[Event],
+    intervals: &[(DateTime<Utc>, DateTime<Utc>, Option<String>)],
+) -> Vec<SessionDay> {
+    let mut days: BTreeMap<String, SessionStat> = BTreeMap::new();
+    let blank = || SessionStat {
+        project: session.project.clone(),
+        session_id: session.session_id.clone(),
+        title: session.title.clone(),
+        file: session.file.clone(),
+        by_hour: vec![0; 24],
+        by_weekday: vec![0; 7],
+        ..Default::default()
+    };
+    for e in events {
+        let day = days.entry(date_key(e.dt_utc)).or_insert_with(&blank);
+        let ts = fmt_dt(e.dt_utc);
+        if day.start.is_empty() || ts < day.start {
+            day.start = ts.clone();
+        }
+        if day.end.is_empty() || ts > day.end {
+            day.end = ts;
+        }
+        day.messages += 1;
+        day.tokens.add(&e.tokens);
+        day.cost_usd += e.cost_usd;
+        if let Some(model) = &e.model {
+            if !day.models.contains(model) {
+                day.models.push(model.clone());
+            }
+            let attr = day.by_model.entry(model.clone()).or_default();
+            attr.messages += 1;
+            attr.tokens.add(&e.tokens);
+            attr.cost_usd += e.cost_usd;
+        }
+        if let Some(skill) = &e.skill {
+            *day.by_skill.entry(skill.clone()).or_default() += 1;
+        }
+        for tool in &e.tools {
+            *day.by_tool.entry(tool.clone()).or_default() += 1;
+            if let Some(rest) = tool.strip_prefix("mcp__") {
+                let server = rest.split("__").next().unwrap_or("");
+                if !server.is_empty() {
+                    *day.by_mcp_server.entry(server.to_string()).or_default() += 1;
+                }
+            }
+        }
+        for ct in &e.content_types {
+            *day.by_content_type.entry(ct.clone()).or_default() += 1;
+        }
+        if let Some(stop) = &e.stop_reason {
+            *day.by_stop_reason.entry(stop.clone()).or_default() += 1;
+        }
+        if let Some(branch) = &e.git_branch {
+            let attr = day.by_branch.entry(branch.clone()).or_default();
+            attr.messages += 1;
+            attr.tokens.add(&e.tokens);
+            attr.cost_usd += e.cost_usd;
+        }
+    }
+    for (start, end, branch) in intervals {
+        let day = days.entry(date_key(*start)).or_insert_with(&blank);
+        let secs = (*end - *start).num_seconds().max(0) as u64;
+        day.active_sec += secs;
+        let local = start.with_timezone(tz());
+        day.by_hour[local.hour() as usize] += secs;
+        day.by_weekday[local.weekday().num_days_from_monday() as usize] += secs;
+        if let Some(branch) = branch {
+            day.by_branch.entry(branch.clone()).or_default().active_sec += secs;
+        }
+        let ts = fmt_dt(*start);
+        let te = fmt_dt(*end);
+        if day.start.is_empty() || ts < day.start {
+            day.start = ts;
+        }
+        if day.end.is_empty() || te > day.end {
+            day.end = te;
+        }
+    }
+    // Split elapsed session wall time by calendar day, including idle periods.
+    let start = DateTime::parse_from_rfc3339(&session.start)
+        .unwrap()
+        .with_timezone(&Utc);
+    let end = DateTime::parse_from_rfc3339(&session.end)
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut cursor = start;
+    while cursor < end {
+        let local = cursor.with_timezone(tz());
+        let next = local
+            .date_naive()
+            .succ_opt()
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let boundary = tz()
+            .from_local_datetime(&next)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let stop = end.min(boundary);
+        let day = days.entry(date_key(cursor)).or_insert_with(&blank);
+        day.total_sec += (stop - cursor).num_seconds().max(0) as u64;
+        if day.start.is_empty() {
+            day.start = fmt_dt(cursor);
+            day.end = fmt_dt(stop);
+        }
+        cursor = stop;
+    }
+    days.into_iter()
+        .map(|(date, session)| SessionDay { date, session })
+        .collect()
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
@@ -594,6 +830,7 @@ struct Report {
     summary: Summary,
     projects: Vec<ProjectStat>,
     sessions: Vec<SessionStat>,
+    session_days: Vec<SessionDay>,
     daily: Vec<DailyStat>,
     by_model: Vec<ModelStat>,
     by_skill: Vec<NamedStat>,
@@ -684,7 +921,22 @@ fn parse_event(v: &Value) -> Option<Event> {
         }
     }
 
+    let billing_key = if typ == "assistant" {
+        let msg_id = v.pointer("/message/id").and_then(Value::as_str);
+        match (msg_id, v.get("requestId").and_then(Value::as_str)) {
+            (Some(m), Some(r)) => Some(format!("message:{m}:request:{r}")),
+            (Some(m), None) => Some(format!("message:{m}")),
+            _ => v
+                .get("uuid")
+                .and_then(Value::as_str)
+                .map(|id| format!("uuid:{id}")),
+        }
+    } else {
+        None
+    };
     Some(Event {
+        billing_key,
+        usage: v.pointer("/message/usage").cloned(),
         cost_usd: event_cost,
         dt_utc: dt,
         model,
@@ -779,12 +1031,18 @@ fn within_range(d: &str, from: &Option<NaiveDate>, to: &Option<NaiveDate>) -> bo
 fn anonymize_report(r: &mut Report) {
     // session.file (full filesystem path) + session.title (potentially identifying)
     let mut title_counter = 0u64;
-    for s in &mut r.sessions {
-        s.file = String::new();
-        if s.title.is_some() {
+    let mut titles = BTreeMap::new();
+    for session in &mut r.sessions {
+        if session.title.is_some() {
             title_counter += 1;
-            s.title = Some(format!("Session {:04}", title_counter));
+            session.title = Some(format!("Session {:04}", title_counter));
         }
+        titles.insert(session.file.clone(), session.title.clone());
+        session.file.clear();
+    }
+    for day in &mut r.session_days {
+        day.session.title = titles.get(&day.session.file).cloned().flatten();
+        day.session.file.clear();
     }
     // project.cwd (raw cwd not affected by --merge)
     for p in &mut r.projects {
@@ -871,9 +1129,23 @@ fn run() -> Result<()> {
         from = today.checked_sub_signed(chrono::Duration::days(args.days));
     }
 
+    let mut loaded = Vec::new();
+    for jsonl in WalkDir::new(&projects_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+    {
+        if let Some((meta, events)) = process_jsonl(jsonl.path()) {
+            loaded.push((jsonl.into_path(), meta, events));
+        }
+    }
+    loaded.sort_by(|a, b| a.0.cmp(&b.0));
+    deduplicate_usage(&mut loaded);
+
     // Per-project aggregates
     let mut projects: BTreeMap<String, ProjectStat> = BTreeMap::new();
     let mut sessions: Vec<SessionStat> = Vec::new();
+    let mut session_days = Vec::new();
     let mut daily: BTreeMap<String, DailyStat> = BTreeMap::new();
     let mut by_model: BTreeMap<String, ModelStat> = BTreeMap::new();
     let mut by_skill: BTreeMap<String, NamedStat> = BTreeMap::new();
@@ -903,332 +1175,353 @@ fn run() -> Result<()> {
 
     let weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-    for entry in fs::read_dir(&projects_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
+    let folder_key = |path: &Path| {
+        path.strip_prefix(&projects_dir)
+            .ok()
+            .and_then(|p| p.components().next())
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+    let mut folder_projects: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+    for (path, meta, events) in &loaded {
+        if events.is_empty() {
             continue;
         }
-        let folder = entry.file_name().to_string_lossy().to_string();
-        let mut project_name = apply_merge(&decode_project_folder(&folder), &merges);
-        let mut project_cwd: Option<String> = None;
-
-        for jsonl in WalkDir::new(&path)
+        let folder = folder_key(path);
+        let entry = folder_projects
+            .entry(folder.clone())
+            .or_insert_with(|| (apply_merge(&decode_project_folder(&folder), &merges), None));
+        if entry.1.is_none() && !meta.cwd.is_empty() {
+            *entry = (apply_merge(&meta.cwd, &merges), Some(meta.cwd.clone()));
+        }
+    }
+    for (jsonl_path, sess_meta, mut events) in loaded {
+        let folder = folder_key(&jsonl_path);
+        let cwd = &sess_meta.cwd;
+        if events.is_empty() {
+            continue;
+        }
+        let (project_name, project_cwd) = folder_projects.get(&folder).unwrap().clone();
+        if !matches_project(&project_name, cwd, &args.project) {
+            continue;
+        }
+        let mut intervals = active_intervals(&events, gap_sec);
+        intervals.retain(|(start, _, _)| within_range(&date_key(*start), &from, &to));
+        events.retain(|e| within_range(&date_key(e.dt_utc), &from, &to));
+        if events.is_empty() && intervals.is_empty() {
+            continue;
+        }
+        let start = events
+            .first()
+            .map(|e| e.dt_utc)
             .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-        {
-            let jsonl_path = jsonl.path();
-            let (sess_meta, events) = match process_jsonl(jsonl_path) {
-                Some(x) => x,
-                None => continue,
-            };
-            let cwd = &sess_meta.cwd;
-            if events.is_empty() {
-                continue;
-            }
-            // prefer real cwd as project name
-            if project_cwd.is_none() && !cwd.is_empty() {
-                project_cwd = Some(cwd.clone());
-                project_name = apply_merge(cwd, &merges);
-            }
-            // date filter on session start
-            let sess_start_date = date_key(events.first().unwrap().dt_utc);
-            if !within_range(&sess_start_date, &from, &to) {
-                continue;
-            }
-            // project filter
-            if !matches_project(&project_name, cwd, &args.project) {
-                continue;
-            }
+            .chain(intervals.first().map(|i| i.0))
+            .min()
+            .unwrap();
+        let end = events
+            .last()
+            .map(|e| e.dt_utc)
+            .into_iter()
+            .chain(intervals.last().map(|i| i.1))
+            .max()
+            .unwrap();
+        let total = (end - start).num_seconds().max(0) as u64;
+        let mut active = 0u64;
+        let mut sess_tokens = Tokens::default();
+        let mut sess_cost = 0.0;
+        let mut sess_models: BTreeMap<String, ()> = BTreeMap::new();
+        let mut sess_msgs = 0u64;
+        let mut sess_by_hour = [0u64; 24];
+        let mut sess_by_weekday = [0u64; 7];
+        let mut sess_by_skill: BTreeMap<String, u64> = BTreeMap::new();
+        let mut sess_by_tool: BTreeMap<String, u64> = BTreeMap::new();
+        let mut sess_by_branch: BTreeMap<String, (u64, u64, Tokens, f64)> = BTreeMap::new();
+        let mut sess_by_mcp: BTreeMap<String, u64> = BTreeMap::new();
+        let mut sess_by_content: BTreeMap<String, u64> = BTreeMap::new();
+        let mut sess_by_stop: BTreeMap<String, u64> = BTreeMap::new();
+        let mut sess_by_model_attr: BTreeMap<String, SessionModelAttr> = BTreeMap::new();
 
-            let start = events.first().unwrap().dt_utc;
-            let end = events.last().unwrap().dt_utc;
-            let total = (end - start).num_seconds().max(0) as u64;
-            let mut active = 0u64;
-            let mut sess_tokens = Tokens::default();
-            let mut sess_cost = 0.0;
-            let mut sess_models: BTreeMap<String, ()> = BTreeMap::new();
-            let mut sess_msgs = 0u64;
-            let mut sess_by_hour = [0u64; 24];
-            let mut sess_by_weekday = [0u64; 7];
-            let mut sess_by_skill: BTreeMap<String, u64> = BTreeMap::new();
-            let mut sess_by_tool: BTreeMap<String, u64> = BTreeMap::new();
-            let mut sess_by_branch: BTreeMap<String, (u64, u64, Tokens, f64)> = BTreeMap::new();
-            let mut sess_by_mcp: BTreeMap<String, u64> = BTreeMap::new();
-            let mut sess_by_content: BTreeMap<String, u64> = BTreeMap::new();
-            let mut sess_by_stop: BTreeMap<String, u64> = BTreeMap::new();
-            let mut sess_by_model_attr: BTreeMap<String, SessionModelAttr> = BTreeMap::new();
-
-            for (a, b) in events.iter().zip(events.iter().skip(1)) {
-                let gap = (b.dt_utc - a.dt_utc).num_seconds().max(0) as u64;
-                if gap <= gap_sec {
-                    active += gap;
-                    // bucket per day / hour / weekday by start ts
-                    let dk = date_key(a.dt_utc);
-                    let day = daily.entry(dk.clone()).or_insert_with(|| DailyStat {
-                        date: dk.clone(),
-                        ..Default::default()
-                    });
-                    day.active_sec += gap;
-                    *day.by_project.entry(project_name.clone()).or_insert(0) += gap;
-                    intervals_by_day
-                        .entry(dk.clone())
-                        .or_default()
-                        .push((a.dt_utc, b.dt_utc));
-                    intervals_by_proj_day
-                        .entry((project_name.clone(), dk.clone()))
-                        .or_default()
-                        .push((a.dt_utc, b.dt_utc));
-
-                    let local = a.dt_utc.with_timezone(tz());
-                    let hour = local.hour() as u8;
-                    let h = by_hour.entry(hour).or_insert(HourStat {
-                        hour,
-                        ..Default::default()
-                    });
-                    h.active_sec += gap;
-                    sess_by_hour[hour as usize] += gap;
-
-                    let wd = local.weekday().num_days_from_monday() as u8;
-                    let w = by_weekday.entry(wd).or_insert(WeekdayStat {
-                        weekday: wd,
-                        name: weekday_names[wd as usize],
-                        ..Default::default()
-                    });
-                    w.active_sec += gap;
-                    sess_by_weekday[wd as usize] += gap;
-                    // attribute gap to the start event's git branch
-                    if let Some(br) = &a.git_branch {
-                        let entry = sess_by_branch
-                            .entry(br.clone())
-                            .or_insert_with(|| (0u64, 0u64, Tokens::default(), 0.0));
-                        entry.0 += gap;
-                    }
-                }
-            }
-
-            // per-event aggregates (messages, tokens, attribution)
-            for e in &events {
-                sess_msgs += 1;
-                let model = e.model.as_deref().unwrap_or("");
-                if e.tokens.total() > 0 && pricing(model, 0).is_none() {
-                    *unpriced_models.entry(model.to_string()).or_default() += e.tokens.total();
-                }
-                let c = e.cost_usd;
-                sess_tokens.add(&e.tokens);
-                sess_cost += c;
-
-                if let Some(m) = &e.model {
-                    sess_models.insert(m.clone(), ());
-                    let ms = by_model.entry(m.clone()).or_insert_with(|| ModelStat {
-                        name: m.clone(),
-                        ..Default::default()
-                    });
-                    ms.messages += 1;
-                    ms.tokens.add(&e.tokens);
-                    ms.cost_usd += c;
-                    let sm = sess_by_model_attr.entry(m.clone()).or_default();
-                    sm.messages += 1;
-                    sm.tokens.add(&e.tokens);
-                    sm.cost_usd += c;
-                }
-                if let Some(s) = &e.skill {
-                    let ns = by_skill.entry(s.clone()).or_insert_with(|| NamedStat {
-                        name: s.clone(),
-                        ..Default::default()
-                    });
-                    ns.messages += 1;
-                    ns.tokens.add(&e.tokens);
-                    ns.cost_usd += c;
-                    *sess_by_skill.entry(s.clone()).or_insert(0) += 1;
-                }
-                if let Some(p) = &e.plugin {
-                    let np = by_plugin.entry(p.clone()).or_insert_with(|| NamedStat {
-                        name: p.clone(),
-                        ..Default::default()
-                    });
-                    np.messages += 1;
-                    np.tokens.add(&e.tokens);
-                    np.cost_usd += c;
-                }
-                // tools, content types, stop reason, branch (from this event)
-                for tool in &e.tools {
-                    *by_tool.entry(tool.clone()).or_insert(0) += 1;
-                    *sess_by_tool.entry(tool.clone()).or_insert(0) += 1;
-                    if let Some(rest) = tool.strip_prefix("mcp__") {
-                        let server = rest.split("__").next().unwrap_or("").to_string();
-                        if !server.is_empty() {
-                            *by_mcp_server.entry(server.clone()).or_insert(0) += 1;
-                            *sess_by_mcp.entry(server).or_insert(0) += 1;
-                        }
-                    }
-                }
-                for ct in &e.content_types {
-                    *by_content.entry(ct.clone()).or_insert(0) += 1;
-                    *sess_by_content.entry(ct.clone()).or_insert(0) += 1;
-                }
-                if let Some(sr) = &e.stop_reason {
-                    *by_stop_reason.entry(sr.clone()).or_insert(0) += 1;
-                    *sess_by_stop.entry(sr.clone()).or_insert(0) += 1;
-                }
-                if let Some(br) = &e.git_branch {
-                    let entry = sess_by_branch
-                        .entry(br.clone())
-                        .or_insert_with(|| (0u64, 0u64, Tokens::default(), 0.0));
-                    entry.1 += 1; // messages
-                    entry.2.add(&e.tokens);
-                    entry.3 += c;
-                }
-
-                let local = e.dt_utc.with_timezone(tz());
-                let hour = local.hour() as u8;
-                let h = by_hour.entry(hour).or_insert(HourStat {
-                    hour,
-                    ..Default::default()
-                });
-                h.messages += 1;
-                let wd = local.weekday().num_days_from_monday() as u8;
-                let w = by_weekday.entry(wd).or_insert(WeekdayStat {
-                    weekday: wd,
-                    name: weekday_names[wd as usize],
-                    ..Default::default()
-                });
-                w.messages += 1;
-
-                let dk = date_key(e.dt_utc);
-                let day = daily.entry(dk.clone()).or_insert_with(|| DailyStat {
-                    date: dk,
-                    ..Default::default()
-                });
-                day.messages += 1;
-                day.tokens.add(&e.tokens);
-                day.cost_usd += c;
-            }
-
-            // session record
-            let session_id = jsonl_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let title = sess_meta
-                .custom_title
-                .clone()
-                .or_else(|| sess_meta.ai_title.clone());
-            let sess_by_branch_serial: BTreeMap<String, SessionBranchAttr> = sess_by_branch
-                .iter()
-                .map(|(k, (a_sec, msgs, tks, cst))| {
-                    (
-                        k.clone(),
-                        SessionBranchAttr {
-                            active_sec: *a_sec,
-                            messages: *msgs,
-                            tokens: tks.clone(),
-                            cost_usd: *cst,
-                        },
-                    )
-                })
-                .collect();
-            sessions.push(SessionStat {
-                project: project_name.clone(),
-                session_id,
-                title,
-                file: jsonl_path.display().to_string(),
-                start: fmt_dt(start),
-                end: fmt_dt(end),
-                active_sec: active,
-                total_sec: total,
-                messages: sess_msgs,
-                tokens: sess_tokens,
-                cost_usd: sess_cost,
-                models: sess_models.into_keys().collect(),
-                by_hour: sess_by_hour.to_vec(),
-                by_weekday: sess_by_weekday.to_vec(),
-                by_skill: sess_by_skill.clone(),
-                by_tool: sess_by_tool.clone(),
-                by_mcp_server: sess_by_mcp,
-                by_content_type: sess_by_content,
-                by_stop_reason: sess_by_stop,
-                by_branch: sess_by_branch_serial,
-                by_model: sess_by_model_attr,
-            });
-
-            // project aggregate
-            let p = projects
-                .entry(project_name.clone())
-                .or_insert_with(|| ProjectStat {
-                    name: project_name.clone(),
-                    cwd: project_cwd.clone(),
-                    by_hour: vec![0u64; 24],
-                    by_weekday: vec![0u64; 7],
-                    ..Default::default()
-                });
-            p.active_sec += active;
-            p.total_sec += total;
-            p.sessions += 1;
-            p.messages += sess_msgs;
-            p.tokens.add(&sess_tokens);
-            p.cost_usd += sess_cost;
-            for i in 0..24 {
-                p.by_hour[i] += sess_by_hour[i];
-            }
-            for i in 0..7 {
-                p.by_weekday[i] += sess_by_weekday[i];
-            }
-            for (k, v) in sess_by_skill {
-                *p.by_skill.entry(k).or_insert(0) += v;
-            }
-            for (k, v) in sess_by_tool {
-                *p.by_tool.entry(k).or_insert(0) += v;
-            }
-            // merge sess_by_branch into global by_branch (one session counted per branch touched)
-            for (br, (a_sec, msgs, tks, cst)) in &sess_by_branch {
-                let bs = by_branch.entry(br.clone()).or_insert_with(|| BranchStat {
-                    name: br.clone(),
-                    ..Default::default()
-                });
-                bs.active_sec += a_sec;
-                bs.messages += msgs;
-                bs.tokens.add(tks);
-                bs.cost_usd += cst;
-                bs.sessions += 1;
-            }
-            if p.first.is_none()
-                || start
-                    < DateTime::parse_from_rfc3339(p.first.as_ref().unwrap())
-                        .unwrap_or_else(|_| Utc::now().into())
-                        .with_timezone(&Utc)
-            {
-                p.first = Some(start.to_rfc3339());
-            }
-            if p.last.is_none()
-                || end
-                    > DateTime::parse_from_rfc3339(p.last.as_ref().unwrap())
-                        .unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap().into())
-                        .with_timezone(&Utc)
-            {
-                p.last = Some(end.to_rfc3339());
-            }
-
-            // daily sessions count
-            let day = daily.entry(sess_start_date).or_insert_with(|| DailyStat {
+        for (seg_start, seg_end, branch) in &intervals {
+            let gap = (*seg_end - *seg_start).num_seconds().max(0) as u64;
+            active += gap;
+            // bucket per day / hour / weekday by start ts
+            let dk = date_key(*seg_start);
+            let day = daily.entry(dk.clone()).or_insert_with(|| DailyStat {
+                date: dk.clone(),
                 ..Default::default()
             });
-            day.sessions += 1;
+            day.active_sec += gap;
+            *day.by_project.entry(project_name.clone()).or_insert(0) += gap;
+            intervals_by_day
+                .entry(dk.clone())
+                .or_default()
+                .push((*seg_start, *seg_end));
+            intervals_by_proj_day
+                .entry((project_name.clone(), dk.clone()))
+                .or_default()
+                .push((*seg_start, *seg_end));
 
-            // grand totals
-            grand_active += active;
-            grand_total += total;
-            grand_msgs += sess_msgs;
-            grand_tokens.add(&sess_tokens);
-            grand_cost += sess_cost;
-            if earliest.is_none() || start < earliest.unwrap() {
-                earliest = Some(start);
+            let local = seg_start.with_timezone(tz());
+            let hour = local.hour() as u8;
+            let h = by_hour.entry(hour).or_insert(HourStat {
+                hour,
+                ..Default::default()
+            });
+            h.active_sec += gap;
+            sess_by_hour[hour as usize] += gap;
+
+            let wd = local.weekday().num_days_from_monday() as u8;
+            let w = by_weekday.entry(wd).or_insert(WeekdayStat {
+                weekday: wd,
+                name: weekday_names[wd as usize],
+                ..Default::default()
+            });
+            w.active_sec += gap;
+            sess_by_weekday[wd as usize] += gap;
+            // attribute gap to the start event's git branch
+            if let Some(br) = branch {
+                let entry = sess_by_branch
+                    .entry(br.clone())
+                    .or_insert_with(|| (0u64, 0u64, Tokens::default(), 0.0));
+                entry.0 += gap;
             }
-            if latest.is_none() || end > latest.unwrap() {
-                latest = Some(end);
+        }
+
+        // per-event aggregates (messages, tokens, attribution)
+        for e in &events {
+            sess_msgs += 1;
+            let model = e.model.as_deref().unwrap_or("");
+            if e.tokens.total() > 0 && pricing(model, 0).is_none() {
+                *unpriced_models.entry(model.to_string()).or_default() += e.tokens.total();
             }
+            let c = e.cost_usd;
+            sess_tokens.add(&e.tokens);
+            sess_cost += c;
+
+            if let Some(m) = &e.model {
+                sess_models.insert(m.clone(), ());
+                let ms = by_model.entry(m.clone()).or_insert_with(|| ModelStat {
+                    name: m.clone(),
+                    ..Default::default()
+                });
+                ms.messages += 1;
+                ms.tokens.add(&e.tokens);
+                ms.cost_usd += c;
+                let sm = sess_by_model_attr.entry(m.clone()).or_default();
+                sm.messages += 1;
+                sm.tokens.add(&e.tokens);
+                sm.cost_usd += c;
+            }
+            if let Some(s) = &e.skill {
+                let ns = by_skill.entry(s.clone()).or_insert_with(|| NamedStat {
+                    name: s.clone(),
+                    ..Default::default()
+                });
+                ns.messages += 1;
+                ns.tokens.add(&e.tokens);
+                ns.cost_usd += c;
+                *sess_by_skill.entry(s.clone()).or_insert(0) += 1;
+            }
+            if let Some(p) = &e.plugin {
+                let np = by_plugin.entry(p.clone()).or_insert_with(|| NamedStat {
+                    name: p.clone(),
+                    ..Default::default()
+                });
+                np.messages += 1;
+                np.tokens.add(&e.tokens);
+                np.cost_usd += c;
+            }
+            // tools, content types, stop reason, branch (from this event)
+            for tool in &e.tools {
+                *by_tool.entry(tool.clone()).or_insert(0) += 1;
+                *sess_by_tool.entry(tool.clone()).or_insert(0) += 1;
+                if let Some(rest) = tool.strip_prefix("mcp__") {
+                    let server = rest.split("__").next().unwrap_or("").to_string();
+                    if !server.is_empty() {
+                        *by_mcp_server.entry(server.clone()).or_insert(0) += 1;
+                        *sess_by_mcp.entry(server).or_insert(0) += 1;
+                    }
+                }
+            }
+            for ct in &e.content_types {
+                *by_content.entry(ct.clone()).or_insert(0) += 1;
+                *sess_by_content.entry(ct.clone()).or_insert(0) += 1;
+            }
+            if let Some(sr) = &e.stop_reason {
+                *by_stop_reason.entry(sr.clone()).or_insert(0) += 1;
+                *sess_by_stop.entry(sr.clone()).or_insert(0) += 1;
+            }
+            if let Some(br) = &e.git_branch {
+                let entry = sess_by_branch
+                    .entry(br.clone())
+                    .or_insert_with(|| (0u64, 0u64, Tokens::default(), 0.0));
+                entry.1 += 1; // messages
+                entry.2.add(&e.tokens);
+                entry.3 += c;
+            }
+
+            let local = e.dt_utc.with_timezone(tz());
+            let hour = local.hour() as u8;
+            let h = by_hour.entry(hour).or_insert(HourStat {
+                hour,
+                ..Default::default()
+            });
+            h.messages += 1;
+            let wd = local.weekday().num_days_from_monday() as u8;
+            let w = by_weekday.entry(wd).or_insert(WeekdayStat {
+                weekday: wd,
+                name: weekday_names[wd as usize],
+                ..Default::default()
+            });
+            w.messages += 1;
+
+            let dk = date_key(e.dt_utc);
+            let day = daily.entry(dk.clone()).or_insert_with(|| DailyStat {
+                date: dk,
+                ..Default::default()
+            });
+            day.messages += 1;
+            day.tokens.add(&e.tokens);
+            day.cost_usd += c;
+        }
+
+        // session record
+        let session_id = jsonl_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let title = sess_meta
+            .custom_title
+            .clone()
+            .or_else(|| sess_meta.ai_title.clone());
+        let sess_by_branch_serial: BTreeMap<String, SessionBranchAttr> = sess_by_branch
+            .iter()
+            .map(|(k, (a_sec, msgs, tks, cst))| {
+                (
+                    k.clone(),
+                    SessionBranchAttr {
+                        active_sec: *a_sec,
+                        messages: *msgs,
+                        tokens: tks.clone(),
+                        cost_usd: *cst,
+                    },
+                )
+            })
+            .collect();
+        sessions.push(SessionStat {
+            project: project_name.clone(),
+            session_id,
+            title,
+            file: jsonl_path.display().to_string(),
+            start: fmt_dt(start),
+            end: fmt_dt(end),
+            active_sec: active,
+            total_sec: total,
+            messages: sess_msgs,
+            tokens: sess_tokens,
+            cost_usd: sess_cost,
+            models: sess_models.into_keys().collect(),
+            by_hour: sess_by_hour.to_vec(),
+            by_weekday: sess_by_weekday.to_vec(),
+            by_skill: sess_by_skill.clone(),
+            by_tool: sess_by_tool.clone(),
+            by_mcp_server: sess_by_mcp,
+            by_content_type: sess_by_content,
+            by_stop_reason: sess_by_stop,
+            by_branch: sess_by_branch_serial,
+            by_model: sess_by_model_attr,
+        });
+
+        session_days.extend(build_session_days(
+            sessions.last().unwrap(),
+            &events,
+            &intervals,
+        ));
+
+        // project aggregate
+        let p = projects
+            .entry(project_name.clone())
+            .or_insert_with(|| ProjectStat {
+                name: project_name.clone(),
+                cwd: project_cwd.clone(),
+                by_hour: vec![0u64; 24],
+                by_weekday: vec![0u64; 7],
+                ..Default::default()
+            });
+        p.active_sec += active;
+        p.total_sec += total;
+        p.sessions += 1;
+        p.messages += sess_msgs;
+        p.tokens.add(&sess_tokens);
+        p.cost_usd += sess_cost;
+        for i in 0..24 {
+            p.by_hour[i] += sess_by_hour[i];
+        }
+        for i in 0..7 {
+            p.by_weekday[i] += sess_by_weekday[i];
+        }
+        for (k, v) in sess_by_skill {
+            *p.by_skill.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in sess_by_tool {
+            *p.by_tool.entry(k).or_insert(0) += v;
+        }
+        // merge sess_by_branch into global by_branch (one session counted per branch touched)
+        for (br, (a_sec, msgs, tks, cst)) in &sess_by_branch {
+            let bs = by_branch.entry(br.clone()).or_insert_with(|| BranchStat {
+                name: br.clone(),
+                ..Default::default()
+            });
+            bs.active_sec += a_sec;
+            bs.messages += msgs;
+            bs.tokens.add(tks);
+            bs.cost_usd += cst;
+            bs.sessions += 1;
+        }
+        if p.first.is_none()
+            || start
+                < DateTime::parse_from_rfc3339(p.first.as_ref().unwrap())
+                    .unwrap_or_else(|_| Utc::now().into())
+                    .with_timezone(&Utc)
+        {
+            p.first = Some(start.to_rfc3339());
+        }
+        if p.last.is_none()
+            || end
+                > DateTime::parse_from_rfc3339(p.last.as_ref().unwrap())
+                    .unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap().into())
+                    .with_timezone(&Utc)
+        {
+            p.last = Some(end.to_rfc3339());
+        }
+
+        // One session contribution per calendar day, including cross-day activity.
+        for slice in session_days
+            .iter()
+            .rev()
+            .take_while(|d| d.session.file == jsonl_path.to_string_lossy())
+        {
+            let day = daily
+                .entry(slice.date.clone())
+                .or_insert_with(|| DailyStat {
+                    date: slice.date.clone(),
+                    ..Default::default()
+                });
+            day.sessions += 1;
+        }
+
+        // grand totals
+        grand_active += active;
+        grand_total += total;
+        grand_msgs += sess_msgs;
+        grand_tokens.add(&sess_tokens);
+        grand_cost += sess_cost;
+        if earliest.is_none() || start < earliest.unwrap() {
+            earliest = Some(start);
+        }
+        if latest.is_none() || end > latest.unwrap() {
+            latest = Some(end);
         }
     }
 
@@ -1359,6 +1652,7 @@ fn run() -> Result<()> {
         summary,
         projects: projects_v,
         sessions,
+        session_days,
         daily: daily_v,
         by_model: by_model_v,
         by_skill: by_skill_v,

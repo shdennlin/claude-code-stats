@@ -93,7 +93,7 @@ The HTML viewer also supports merge rules interactively (no rerun needed) — us
 
 | File | Contents |
 |---|---|
-| `data.json` | Full structured report — `summary`, `projects`, `sessions`, `daily`, `by_model`, `by_skill`, `by_plugin`, `by_tool`, `by_mcp_server`, `by_content_type`, `by_stop_reason`, `by_branch`, `by_hour`, `by_weekday`. |
+| `data.json` | Full structured report — `summary`, `projects`, `sessions`, `session_days`, `daily`, `by_model`, `by_skill`, `by_plugin`, `by_tool`, `by_mcp_server`, `by_content_type`, `by_stop_reason`, `by_branch`, `by_hour`, `by_weekday`. |
 | `daily.csv` / `projects.csv` / `sessions.csv` | Flat CSVs for spreadsheet drilling. |
 | `report.html` | Self-contained interactive viewer (data embedded). Open in any browser. Filters, charts, sortable tables, drilldown, localStorage-persisted state. |
 
@@ -105,7 +105,7 @@ The HTML viewer also supports merge rules interactively (no rerun needed) — us
 | **Active time (union)** | Wall-clock union of all sessions' gaps per day (parallel sessions deduped). The truer "you were really in front of the laptop" number. |
 | **Parallelism** | `sum / union`. 1.0× = sequential; higher = you ran multiple Claude Code sessions in parallel. |
 | **Total wall-clock** | First → last message per session, summed. Includes idle (sessions left open). |
-| **Tokens** | input / output / cache_create (5m+1h) / cache_read, summed from `usage` in assistant messages. |
+| **Tokens** | input / output / cache_create (5m+1h) / cache_read from assistant `usage`. Repeated `message.id` + `requestId` snapshots merge by per-field maximum and are counted once across all transcript files. |
 | **Cost (estimate)** | Pay-as-you-go API rates per model. Max-plan subscribers don't actually pay this — it's an equivalent-cost reference. |
 | **Cache hit rate** | `cache_read / (cache_read + cache_create + input)`. |
 | **Skills / plugins** | From `attributionSkill` / `attributionPlugin`. |
@@ -153,6 +153,34 @@ Costs are API-equivalent estimates, not subscription bills. The calculation does
 not include Batch discounts, partner-cloud pricing, server-tool fees, negotiated
 discounts, or historical price changes. The committed live demo is a static
 snapshot; run `make run` to generate a report using the corrected rates.
+
+### Usage deduplication and date filters
+
+Billing uses the same principles as Syrtis's pinned
+[tokscale-core Claude parser](https://github.com/Nanako0129/tokscale-core/blob/8fc63cedfaf4aeec73c9a4e65711c280e7add15e/src/sessions/claudecode.rs):
+`message.id` + `requestId` identifies a response; without a request ID, the
+message ID is used, then the record UUID if available. Records with no stable
+identifier are kept independently. Token usage takes its maximum across
+streaming snapshots and copied/forked transcripts, rather than their sum.
+Cache writes merge the total and 1-hour portion first; the 5-minute portion is
+the remainder, so later TTL details do not inflate the total.
+
+The earliest matching event owns the merged usage. Equal timestamps use sorted
+file paths as a deterministic tie-breaker. This avoids double billing while
+keeping totals stable across scans; a copied response contributes cost to one
+project/session, not every transcript that contains it. Deduplication happens
+before date and project filters, so filtering cannot re-bill a copied response.
+Raw event counts, tools and activity remain transcript statistics.
+
+CLI dates filter events in the scan timezone. HTML filters use `session_days`
+(the daily slices of each session) for costs, tokens, activity, tool/skill counts,
+and model/branch attribution, then regroup into one row per session. A session
+that began before the selected dates still contributes usage within them.
+Active intervals are split at hour and calendar-day boundaries. Costs divided
+by days use the number of calendar days in the selected window.
+
+`make test` runs the Rust pricing tests, Python CLI regressions, and Node report
+filter regressions; Python 3 and Node are required for the latter two.
 
 ## Performance
 

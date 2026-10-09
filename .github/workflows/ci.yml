@@ -38,3 +38,10 @@ jobs:
 
       - name: cargo test
         run: cargo test --release --verbose
+
+      - name: Usage and report date regression tests
+        env:
+          CC_STATS_BIN: target/release/cc-stats
+        run: |
+          python3 tests/usage_regression.py
+          node tests/report_dates.cjs

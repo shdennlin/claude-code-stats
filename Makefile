@@ -16,8 +16,11 @@ build: ## Build the release binary
 run: build ## Build, run, and open the report
 	./$(TARGET) --open $(ARGS)
 
-test: ## Run unit tests
+test: ## Run unit and report regression tests
 	cargo test
+	cargo build
+	python3 tests/usage_regression.py
+	node tests/report_dates.cjs
 
 clean: ## Remove build artifacts
 	cargo clean
