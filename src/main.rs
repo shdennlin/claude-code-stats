@@ -140,7 +140,7 @@ fn parse_tz(s: &str) -> Result<FixedOffset> {
     FixedOffset::east_opt(sign * (h * 3600 + m * 60)).context("invalid tz offset (range)")
 }
 
-#[derive(Debug, Default, Serialize, Clone, Copy)]
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
 struct Tokens {
     input: u64,
     output: u64,
@@ -164,25 +164,51 @@ impl Tokens {
     }
 }
 
-// pricing per million tokens (USD)
-fn pricing(model: &str) -> (f64, f64, f64, f64, f64) {
-    // (input, output, cache_write_5m, cache_write_1h, cache_read)
-    let m = model.to_lowercase();
-    if m.contains("fable") || m.contains("fabel") {
-        (10.0, 50.0, 12.5, 20.0, 1.0)
-    } else if m.contains("opus") {
-        (15.0, 75.0, 18.75, 30.0, 1.50)
-    } else if m.contains("haiku") {
-        (1.0, 5.0, 1.25, 2.0, 0.10)
-    } else if m.contains("sonnet") {
-        (3.0, 15.0, 3.75, 6.0, 0.30)
-    } else {
-        (3.0, 15.0, 3.75, 6.0, 0.30)
+// Standard first-party API prices, USD per million tokens, checked 2026-10-09.
+// https://platform.claude.com/docs/en/about-claude/pricing
+// Keep versions explicit: future models must not silently inherit old prices.
+fn model_id(model: &str) -> String {
+    let m = model
+        .to_lowercase()
+        .replace("claude-fabel-", "claude-fable-");
+    // Accept dated snapshots and the documented latest aliases only.
+    let mut id = m.as_str();
+    if let Some(base) = id.strip_suffix("-latest") {
+        id = base;
     }
+    if let Some((base, date)) = id.rsplit_once('-') {
+        if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) {
+            id = base;
+        }
+    }
+    id.to_string()
+}
+
+fn pricing(model: &str, prompt_tokens: u64) -> Option<(f64, f64, f64, f64, f64)> {
+    let (input, output, read) = match model_id(model).as_str() {
+        "claude-fable-5-1" | "claude-mythos-5-1" => (10.0, 50.0, 0.25),
+        "claude-fable-5" | "claude-mythos-5" => (10.0, 50.0, 1.0),
+        "claude-opus-5-5" => (4.0, 20.0, 0.20),
+        "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
+        | "claude-opus-4-5" => (5.0, 25.0, 0.50),
+        "claude-opus-4-1" | "claude-opus-4" => (15.0, 75.0, 1.50),
+        "claude-sonnet-5-5" => (2.0, 10.0, 0.10),
+        "claude-sonnet-5" => (2.0, 10.0, 0.20),
+        "claude-sonnet-4-6" | "claude-sonnet-4-5" | "claude-sonnet-4" => (3.0, 15.0, 0.30),
+        "claude-haiku-5-5" if prompt_tokens > 100_000 => (0.50, 2.50, 0.05),
+        "claude-haiku-5-5" => (0.10, 0.50, 0.01),
+        "claude-haiku-4-5" => (1.0, 5.0, 0.10),
+        "claude-3-5-haiku" => (0.80, 4.0, 0.08),
+        _ => return None,
+    };
+    Some((input, output, input * 1.25, input * 2.0, read))
 }
 
 fn cost_usd(t: &Tokens, model: &str) -> f64 {
-    let (i, o, c5, c1, cr) = pricing(model);
+    let prompt_tokens = t.input + t.cache_create_5m + t.cache_create_1h + t.cache_read;
+    let Some((i, o, c5, c1, cr)) = pricing(model, prompt_tokens) else {
+        return 0.0;
+    };
     (t.input as f64 * i
         + t.output as f64 * o
         + t.cache_create_5m as f64 * c5
@@ -191,19 +217,226 @@ fn cost_usd(t: &Tokens, model: &str) -> f64 {
         / 1_000_000.0
 }
 
+fn usage_tokens(u: &Value) -> Tokens {
+    let mut tokens = Tokens {
+        input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+        output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+        cache_read: u
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        ..Default::default()
+    };
+    // split cache creation into 5m / 1h if available
+    if let Some(cc) = u.get("cache_creation") {
+        tokens.cache_create_5m = cc
+            .get("ephemeral_5m_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        tokens.cache_create_1h = cc
+            .get("ephemeral_1h_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+    } else {
+        tokens.cache_create_5m = u
+            .get("cache_creation_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+    }
+    tokens
+}
+
+fn usage_cost_usd(u: &Value, model: &str, tokens: &Tokens) -> f64 {
+    // Iterations are individual API calls; Haiku's tier applies per call.
+    // Only use the breakdown if it reconciles with the recorded totals.
+    let mut total = *tokens;
+    total.iterations = 0;
+    let mut cost = cost_usd(tokens, model);
+    if let Some(iterations) = u.get("iterations").and_then(Value::as_array) {
+        let mut sum = Tokens::default();
+        let mut iteration_cost = 0.0;
+        for iteration in iterations {
+            let t = usage_tokens(iteration);
+            sum.add(&t);
+            iteration_cost += cost_usd(&t, model);
+        }
+        if !iterations.is_empty() && sum == total {
+            cost = iteration_cost;
+        }
+    }
+    // Fast mode doubles all token rates on the supported Opus versions.
+    if u.get("speed").and_then(Value::as_str) == Some("fast")
+        && matches!(
+            model_id(model).as_str(),
+            "claude-opus-5-5" | "claude-opus-5" | "claude-opus-4-8"
+        )
+    {
+        cost *= 2.0;
+    }
+    if u.get("inference_geo").and_then(Value::as_str) == Some("us") {
+        cost *= 1.1;
+    }
+    cost
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn costs_use_version_specific_rates_for_each_token_category() {
+        let cases = [
+            ("claude-opus-5", [5.0, 25.0, 6.25, 10.0, 0.5]),
+            ("claude-opus-5-5", [4.0, 20.0, 5.0, 8.0, 0.2]),
+            ("claude-opus-4-8", [5.0, 25.0, 6.25, 10.0, 0.5]),
+            ("claude-opus-4-7", [5.0, 25.0, 6.25, 10.0, 0.5]),
+            ("claude-opus-4-6", [5.0, 25.0, 6.25, 10.0, 0.5]),
+            ("claude-opus-4-5-20251101", [5.0, 25.0, 6.25, 10.0, 0.5]),
+            ("claude-opus-4-1-20250805", [15.0, 75.0, 18.75, 30.0, 1.5]),
+            ("claude-opus-4-20250514", [15.0, 75.0, 18.75, 30.0, 1.5]),
+            ("claude-sonnet-5", [2.0, 10.0, 2.5, 4.0, 0.2]),
+            ("claude-sonnet-5-5", [2.0, 10.0, 2.5, 4.0, 0.1]),
+            ("claude-sonnet-4-6", [3.0, 15.0, 3.75, 6.0, 0.3]),
+            ("claude-sonnet-4-5-20250929", [3.0, 15.0, 3.75, 6.0, 0.3]),
+            ("claude-sonnet-4-20250514", [3.0, 15.0, 3.75, 6.0, 0.3]),
+            ("claude-fable-5", [10.0, 50.0, 12.5, 20.0, 1.0]),
+            ("claude-fable-5-1", [10.0, 50.0, 12.5, 20.0, 0.25]),
+            ("claude-mythos-5", [10.0, 50.0, 12.5, 20.0, 1.0]),
+            ("claude-mythos-5-1", [10.0, 50.0, 12.5, 20.0, 0.25]),
+            ("claude-haiku-4-5-20251001", [1.0, 5.0, 1.25, 2.0, 0.1]),
+            ("claude-3-5-haiku-20241022", [0.8, 4.0, 1.0, 1.6, 0.08]),
+        ];
+        for (model, rates) in cases {
+            for (category, rate) in rates.into_iter().enumerate() {
+                let mut t = Tokens::default();
+                match category {
+                    0 => t.input = 1,
+                    1 => t.output = 1,
+                    2 => t.cache_create_5m = 1,
+                    3 => t.cache_create_1h = 1,
+                    _ => t.cache_read = 1,
+                }
+                assert!(
+                    (cost_usd(&t, model) - rate / 1_000_000.0).abs() < 1e-12,
+                    "{model} category {category}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn haiku_prompt_threshold_counts_both_cache_write_types_and_reads() {
+        let mut t = Tokens {
+            input: 1,
+            output: 10,
+            cache_create_5m: 10_000,
+            cache_create_1h: 20_000,
+            cache_read: 69_999,
+            ..Default::default()
+        };
+        let low = (0.1 + 5.0 + 1250.0 + 4000.0 + 699.99) / 1_000_000.0;
+        assert!((cost_usd(&t, "claude-haiku-5-5") - low).abs() < 1e-12);
+        t.cache_read += 1;
+        let high = (0.5 + 25.0 + 6250.0 + 20000.0 + 3500.0) / 1_000_000.0;
+        assert!((cost_usd(&t, "claude-haiku-5-5") - high).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unknown_models_never_inherit_a_known_models_price() {
+        let t = Tokens {
+            input: 1_000_000,
+            ..Default::default()
+        };
+        for model in [
+            "",
+            "<synthetic>",
+            "claude-opus-6",
+            "claude-opus-5-9",
+            "not-sonnet",
+        ] {
+            assert_eq!(cost_usd(&t, model), 0.0, "{model}");
+        }
+    }
+
+    #[test]
+    fn haiku_iterations_are_priced_as_separate_requests() {
+        let v = serde_json::json!({
+            "timestamp": "2026-10-09T00:00:00Z", "type": "assistant",
+            "message": {"model": "claude-haiku-5-5", "usage": {
+                "input_tokens": 120000, "output_tokens": 20,
+                "iterations": [
+                    {"input_tokens": 60000, "output_tokens": 10},
+                    {"input_tokens": 60000, "output_tokens": 10}
+                ]
+            }}
+        });
+        let e = parse_event(&v).unwrap();
+        assert!((e.cost_usd - 0.01201).abs() < 1e-12);
+    }
+
+    #[test]
+    fn recorded_fast_and_us_inference_modifiers_stack() {
+        let v = serde_json::json!({
+            "timestamp": "2026-10-09T00:00:00Z", "type": "assistant",
+            "message": {"model": "claude-opus-5-5", "usage": {
+                "input_tokens": 1000000, "output_tokens": 1000000,
+                "cache_read_input_tokens": 1000000,
+                "speed": "fast", "inference_geo": "us"
+            }}
+        });
+        let e = parse_event(&v).unwrap();
+        assert!((e.cost_usd - 53.24).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unsupported_fast_mode_does_not_raise_opus_47_price() {
+        let u = serde_json::json!({"input_tokens": 1000000, "speed": "fast"});
+        assert_eq!(
+            usage_cost_usd(&u, "claude-opus-4-7", &usage_tokens(&u)),
+            5.0
+        );
+    }
+
+    #[test]
+    fn incomplete_iteration_breakdown_keeps_top_level_usage() {
+        let u = serde_json::json!({"input_tokens": 120000, "iterations": [
+            {"input_tokens": 60000}
+        ]});
+        assert_eq!(
+            usage_cost_usd(&u, "claude-haiku-5-5", &usage_tokens(&u)),
+            0.06
+        );
+    }
+
+    #[test]
+    fn model_aliases_and_snapshots_keep_their_versions() {
+        assert_eq!(
+            pricing("CLAUDE-OPUS-5-5-20261001", 0),
+            pricing("claude-opus-5-5", 0)
+        );
+        assert_eq!(
+            pricing("claude-sonnet-4-5-latest", 0),
+            pricing("claude-sonnet-4-5", 0)
+        );
+        assert_eq!(pricing("claude-opus-5-50", 0), None);
+    }
+
+    #[test]
     fn pricing_recognizes_fable_models() {
-        assert_eq!(pricing("claude-fable-5"), (10.0, 50.0, 12.5, 20.0, 1.0));
-        assert_eq!(pricing("claude-fabel-5"), (10.0, 50.0, 12.5, 20.0, 1.0));
+        assert_eq!(
+            pricing("claude-fable-5", 0),
+            Some((10.0, 50.0, 12.5, 20.0, 1.0))
+        );
+        assert_eq!(
+            pricing("claude-fabel-5", 0),
+            Some((10.0, 50.0, 12.5, 20.0, 1.0))
+        );
     }
 }
 
 #[derive(Debug)]
 struct Event {
+    cost_usd: f64,
     dt_utc: DateTime<Utc>,
     model: Option<String>,
     skill: Option<String>,
@@ -401,6 +634,7 @@ fn parse_event(v: &Value) -> Option<Event> {
     let typ = v.get("type")?.as_str()?;
 
     let mut tokens = Tokens::default();
+    let mut event_cost = 0.0;
     let mut model = None;
     let mut stop_reason = None;
     let mut content_types: Vec<String> = Vec::new();
@@ -438,28 +672,8 @@ fn parse_event(v: &Value) -> Option<Event> {
                 }
             }
             if let Some(u) = msg.get("usage") {
-                tokens.input = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                tokens.output = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                tokens.cache_read = u
-                    .get("cache_read_input_tokens")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
-                // split cache creation into 5m / 1h if available
-                if let Some(cc) = u.get("cache_creation") {
-                    tokens.cache_create_5m = cc
-                        .get("ephemeral_5m_input_tokens")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
-                    tokens.cache_create_1h = cc
-                        .get("ephemeral_1h_input_tokens")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
-                } else {
-                    tokens.cache_create_5m = u
-                        .get("cache_creation_input_tokens")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
-                }
+                tokens = usage_tokens(u);
+                event_cost = usage_cost_usd(u, model.as_deref().unwrap_or(""), &tokens);
                 // iterations[] = number of model calls within this assistant turn
                 tokens.iterations = u
                     .get("iterations")
@@ -471,6 +685,7 @@ fn parse_event(v: &Value) -> Option<Event> {
     }
 
     Some(Event {
+        cost_usd: event_cost,
         dt_utc: dt,
         model,
         skill,
@@ -676,6 +891,7 @@ fn run() -> Result<()> {
     let mut grand_msgs = 0u64;
     let mut grand_tokens = Tokens::default();
     let mut grand_cost = 0.0;
+    let mut unpriced_models: BTreeMap<String, u64> = BTreeMap::new();
     // collect (start, end) intervals per day for union calculation
     let mut intervals_by_day: BTreeMap<String, Vec<(DateTime<Utc>, DateTime<Utc>)>> =
         BTreeMap::new();
@@ -795,7 +1011,11 @@ fn run() -> Result<()> {
             // per-event aggregates (messages, tokens, attribution)
             for e in &events {
                 sess_msgs += 1;
-                let c = cost_usd(&e.tokens, e.model.as_deref().unwrap_or(""));
+                let model = e.model.as_deref().unwrap_or("");
+                if e.tokens.total() > 0 && pricing(model, 0).is_none() {
+                    *unpriced_models.entry(model.to_string()).or_default() += e.tokens.total();
+                }
+                let c = e.cost_usd;
                 sess_tokens.add(&e.tokens);
                 sess_cost += c;
 
@@ -1184,6 +1404,10 @@ fn run() -> Result<()> {
         if args.open {
             let _ = std::process::Command::new("open").arg(&p).status();
         }
+    }
+
+    for (model, tokens) in &unpriced_models {
+        eprintln!("warning: no verified price for model {model:?}; {tokens} tokens excluded from cost estimates");
     }
 
     // CLI summary print

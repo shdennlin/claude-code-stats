@@ -117,12 +117,42 @@ The HTML viewer also supports merge rules interactively (no rerun needed) — us
 
 ### Pricing table (USD per million tokens)
 
-| Model  | input | output | cache_write_5m | cache_write_1h | cache_read |
-|---|---|---|---|---|---|
-| Fable  | 10 | 50 | 12.50 | 20 | 1.00 |
-| Opus   | 15 | 75 | 18.75 | 30 | 1.50 |
-| Sonnet | 3  | 15 | 3.75  | 6  | 0.30 |
-| Haiku  | 1  | 5  | 1.25  | 2  | 0.10 |
+Standard first-party API rates, checked **2026-10-09** against
+[Anthropic's pricing documentation](https://platform.claude.com/docs/en/about-claude/pricing).
+Models are matched by version, including dated snapshots and `-latest` aliases.
+
+| Model | input | output | cache_write_5m | cache_write_1h | cache_read |
+|---|---:|---:|---:|---:|---:|
+| Fable / Mythos 5.1 | 10 | 50 | 12.50 | 20 | 0.25 |
+| Fable / Mythos 5 | 10 | 50 | 12.50 | 20 | 1.00 |
+| Opus 5.5 | 4 | 20 | 5 | 8 | 0.20 |
+| Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 | 5 | 25 | 6.25 | 10 | 0.50 |
+| Opus 4.1 / 4 | 15 | 75 | 18.75 | 30 | 1.50 |
+| Sonnet 5.5 | 2 | 10 | 2.50 | 4 | 0.10 |
+| Sonnet 5 | 2 | 10 | 2.50 | 4 | 0.20 |
+| Sonnet 4.6 / 4.5 / 4 | 3 | 15 | 3.75 | 6 | 0.30 |
+| Haiku 5.5, prompt ≤100k | 0.10 | 0.50 | 0.125 | 0.20 | 0.01 |
+| Haiku 5.5, prompt >100k | 0.50 | 2.50 | 0.625 | 1 | 0.05 |
+| Haiku 4.5 | 1 | 5 | 1.25 | 2 | 0.10 |
+| Haiku 3.5 | 0.80 | 4 | 1 | 1.60 | 0.08 |
+
+Haiku's prompt length includes input, cache writes, and cache reads; output tokens
+are excluded. Each request uses its own tier. When a message includes an
+`iterations` breakdown that reconciles with its usage totals, each iteration is
+priced separately; otherwise the top-level usage is used as an estimate.
+
+Recorded `usage.speed: "fast"` doubles rates for Opus 5.5, Opus 5, and Opus 4.8.
+Recorded `usage.inference_geo: "us"` applies a 1.1× multiplier. Both stack with
+cache pricing. Missing modifiers use standard global pricing.
+
+Unknown models retain their token counts but contribute **zero estimated cost**;
+the CLI warns when unpriced tokens are found, so the cost total is incomplete in
+that case. `<synthetic>` messages with no tokens incur no charge.
+
+Costs are API-equivalent estimates, not subscription bills. The calculation does
+not include Batch discounts, partner-cloud pricing, server-tool fees, negotiated
+discounts, or historical price changes. The committed live demo is a static
+snapshot; run `make run` to generate a report using the corrected rates.
 
 ## Performance
 
