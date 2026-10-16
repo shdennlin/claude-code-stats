@@ -34,3 +34,6 @@ desktop.ini
 
 # Local copy of demo regen script (contains your real project paths)
 scripts/regen-demo.sh
+
+# Per-machine Makefile overrides
+/Makefile.local

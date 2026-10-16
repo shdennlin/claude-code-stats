@@ -20,8 +20,8 @@ const REPORT_HTML_TEMPLATE: &str = include_str!("../templates/report.html");
 #[derive(Parser, Debug)]
 #[command(name = "cc-stats", about = "Claude Code usage analytics")]
 struct Args {
-    /// Path to Claude projects dir
-    #[arg(long, default_value = "~/.claude/projects")]
+    /// Path to Claude projects dir (e.g. a rsync backup of ~/.claude/projects)
+    #[arg(long, visible_alias = "source", default_value = "~/.claude/projects")]
     dir: String,
 
     /// Output dir
