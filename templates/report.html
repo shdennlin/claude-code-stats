@@ -155,7 +155,13 @@
 
   <section class="grid-2">
     <div class="panel">
-      <h2>By hour of day (scan TZ) <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span></h2>
+      <h2>By hour of day (scan TZ) <span class="muted" style="font-size:12px;font-weight:normal">— filtered</span>
+        <select id="hour-metric" style="width:auto;margin-left:8px;font-size:12px;font-weight:normal">
+          <option value="active">Active hours</option>
+          <option value="output">Output tokens</option>
+          <option value="cost">Est. cost (USD)</option>
+        </select>
+      </h2>
       <div class="chart-wrap"><canvas id="ch-hour"></canvas></div>
     </div>
     <div class="panel">
@@ -321,6 +327,7 @@ function saveState() {
       sesCols: Array.from(state.sesCols),
       sesFilter: state.sesFilter,
       sesLimit: state.sesLimit,
+      hourMetric: state.hourMetric,
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(blob));
   } catch (e) { /* quota / private mode — silently ignore */ }
@@ -347,6 +354,7 @@ function loadState() {
     if (Array.isArray(s.sesCols)) state.sesCols = new Set(s.sesCols);
     if (typeof s.sesFilter === 'string') state.sesFilter = s.sesFilter;
     if (typeof s.sesLimit === 'number') state.sesLimit = s.sesLimit;
+    if (HOUR_METRICS[s.hourMetric]) state.hourMetric = s.hourMetric;
     return true;
   } catch (e) { return false; }
 }
@@ -511,6 +519,7 @@ const state = {
   sesCols: new Set(SES_COLS.filter(c => c.on).map(c => c.key)),
   sesFilter: '',
   sesLimit: 100,
+  hourMetric: 'active',  // 'active' | 'output' | 'cost' — what the by-hour chart plots
 };
 
 function startResize(ev, th, key) {
@@ -663,6 +672,13 @@ function init() {
   if (sesFilterInput) {
     sesFilterInput.value = state.sesFilter;
     sesFilterInput.addEventListener('input', e => { state.sesFilter = e.target.value; render(); });
+  }
+  const hourMetricSelect = document.getElementById('hour-metric');
+  if (hourMetricSelect) {
+    hourMetricSelect.value = state.hourMetric;
+    hourMetricSelect.addEventListener('change', e => {
+      if (HOUR_METRICS[e.target.value]) { state.hourMetric = e.target.value; saveState(); render(); }
+    });
   }
   if (sesLimitSelect) {
     sesLimitSelect.value = String(state.sesLimit);
@@ -925,7 +941,7 @@ function sessionsInRange(sessions, from, to) {
   function addMetric(target, key, value) {
     if (typeof value === 'number') target[key] = (target[key] || 0) + value;
     else if (Array.isArray(value)) {
-      if (key === 'by_hour' || key === 'by_weekday') {
+      if (key === 'by_hour' || key === 'by_weekday' || key === 'by_hour_output' || key === 'by_hour_cost') {
         const old = target[key] || [];
         target[key] = value.map((v, i) => v + (old[i] || 0));
       } else target[key] = Array.from(new Set([...(target[key] || []), ...value]));
@@ -1637,17 +1653,25 @@ function renderDaily(f) {
   });
 }
 
+// What the by-hour chart can plot. Each reads a per-session 24-slot array (summed over the filtered sessions)
+// and scales it for display; output/cost are bucketed by the hour of the (deduplicated) response event.
+const HOUR_METRICS = {
+  active: {key:'by_hour',        label:'Active hours (filtered)',       scale: v => v/3600},
+  output: {key:'by_hour_output', label:'Output tokens (filtered)',      scale: v => v},
+  cost:   {key:'by_hour_cost',   label:'Est. cost, USD (filtered)',     scale: v => v},
+};
 function renderHour(f) {
+  const m = HOUR_METRICS[state.hourMetric] || HOUR_METRICS.active;
   const hours = new Array(24).fill(0);
   for (const s of f.sessions_list) {
-    const arr = s.by_hour || [];
+    const arr = s[m.key] || [];
     for (let i = 0; i < 24; i++) hours[i] += (arr[i] || 0);
   }
   makeChart('ch-hour', {
     type:'bar',
     data:{
       labels: hours.map((_, i) => String(i).padStart(2,'0')),
-      datasets:[{label:'Active hours (filtered)', data: hours.map(s => s/3600), backgroundColor:C_ACCENT2}]
+      datasets:[{label:m.label, data: hours.map(m.scale), backgroundColor:C_ACCENT2}]
     },
     options: gridOpts(),
   });

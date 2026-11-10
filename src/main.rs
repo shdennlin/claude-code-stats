@@ -501,6 +501,8 @@ struct SessionStat {
     cost_usd: f64,
     models: Vec<String>,
     by_hour: Vec<u64>,                              // 24, active_sec
+    by_hour_output: Vec<u64>,                       // 24, output tokens per scan-tz hour of the event
+    by_hour_cost: Vec<f64>,                         // 24, estimated cost per scan-tz hour of the event
     by_weekday: Vec<u64>,                           // 7, active_sec
     by_skill: BTreeMap<String, u64>,                // skill -> messages
     by_tool: BTreeMap<String, u64>,                 // tool -> uses
@@ -640,11 +642,16 @@ fn build_session_days(
         title: session.title.clone(),
         file: session.file.clone(),
         by_hour: vec![0; 24],
+        by_hour_output: vec![0; 24],
+        by_hour_cost: vec![0.0; 24],
         by_weekday: vec![0; 7],
         ..Default::default()
     };
     for e in events {
         let day = days.entry(date_key(e.dt_utc)).or_insert_with(&blank);
+        let event_hour = e.dt_utc.with_timezone(tz()).hour() as usize;
+        day.by_hour_output[event_hour] += e.tokens.output;
+        day.by_hour_cost[event_hour] += e.cost_usd;
         let ts = fmt_dt(e.dt_utc);
         if day.start.is_empty() || ts < day.start {
             day.start = ts.clone();
@@ -777,6 +784,8 @@ struct HourStat {
     hour: u8, // 0-23 local
     messages: u64,
     active_sec: u64,
+    output_tokens: u64, // deduplicated assistant output tokens
+    cost_usd: f64,      // deduplicated API-equivalent cost estimate
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
@@ -1232,6 +1241,8 @@ fn run() -> Result<()> {
         let mut sess_models: BTreeMap<String, ()> = BTreeMap::new();
         let mut sess_msgs = 0u64;
         let mut sess_by_hour = [0u64; 24];
+        let mut sess_by_hour_output = [0u64; 24];
+        let mut sess_by_hour_cost = [0f64; 24];
         let mut sess_by_weekday = [0u64; 7];
         let mut sess_by_skill: BTreeMap<String, u64> = BTreeMap::new();
         let mut sess_by_tool: BTreeMap<String, u64> = BTreeMap::new();
@@ -1367,6 +1378,10 @@ fn run() -> Result<()> {
                 ..Default::default()
             });
             h.messages += 1;
+            h.output_tokens += e.tokens.output;
+            h.cost_usd += c;
+            sess_by_hour_output[hour as usize] += e.tokens.output;
+            sess_by_hour_cost[hour as usize] += c;
             let wd = local.weekday().num_days_from_monday() as u8;
             let w = by_weekday.entry(wd).or_insert(WeekdayStat {
                 weekday: wd,
@@ -1423,6 +1438,8 @@ fn run() -> Result<()> {
             cost_usd: sess_cost,
             models: sess_models.into_keys().collect(),
             by_hour: sess_by_hour.to_vec(),
+            by_hour_output: sess_by_hour_output.to_vec(),
+            by_hour_cost: sess_by_hour_cost.to_vec(),
             by_weekday: sess_by_weekday.to_vec(),
             by_skill: sess_by_skill.clone(),
             by_tool: sess_by_tool.clone(),
