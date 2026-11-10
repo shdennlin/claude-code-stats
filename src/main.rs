@@ -599,16 +599,16 @@ struct SessionStat {
     cost_usd: f64,
     models: Vec<String>,
     by_hour: Vec<u64>,                              // 24, active_sec
-    by_hour_output: Vec<u64>,                       // 24, output tokens per scan-tz hour of the event
-    by_hour_cost: Vec<f64>,                         // 24, estimated cost per scan-tz hour of the event
-    by_weekday: Vec<u64>,                           // 7, active_sec
-    by_skill: BTreeMap<String, u64>,                // skill -> messages
-    by_tool: BTreeMap<String, u64>,                 // tool -> uses
-    by_mcp_server: BTreeMap<String, u64>,           // mcp server -> uses
-    by_content_type: BTreeMap<String, u64>,         // type -> count
-    by_stop_reason: BTreeMap<String, u64>,          // reason -> count
+    by_hour_output: Vec<u64>, // 24, output tokens per scan-tz hour of the event
+    by_hour_cost: Vec<f64>,   // 24, estimated cost per scan-tz hour of the event
+    by_weekday: Vec<u64>,     // 7, active_sec
+    by_skill: BTreeMap<String, u64>, // skill -> messages
+    by_tool: BTreeMap<String, u64>, // tool -> uses
+    by_mcp_server: BTreeMap<String, u64>, // mcp server -> uses
+    by_content_type: BTreeMap<String, u64>, // type -> count
+    by_stop_reason: BTreeMap<String, u64>, // reason -> count
     by_branch: BTreeMap<String, SessionBranchAttr>, // branch -> {active_sec, msgs, tokens, cost}
-    by_model: BTreeMap<String, SessionModelAttr>,   // model -> {msgs, tokens, cost}
+    by_model: BTreeMap<String, SessionModelAttr>, // model -> {msgs, tokens, cost}
 }
 
 #[derive(Debug, Serialize, Clone)]
