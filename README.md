@@ -123,6 +123,7 @@ Models are matched by version, including dated snapshots and `-latest` aliases.
 
 | Model | input | output | cache_write_5m | cache_write_1h | cache_read |
 |---|---:|---:|---:|---:|---:|
+| Fable / Mythos 5.2 | 8 | 40 | 10 | 16 | 0.20 |
 | Fable / Mythos 5.1 | 10 | 50 | 12.50 | 20 | 0.25 |
 | Fable / Mythos 5 | 10 | 50 | 12.50 | 20 | 1.00 |
 | Opus 5.5 | 4 | 20 | 5 | 8 | 0.20 |
@@ -153,6 +154,19 @@ Costs are API-equivalent estimates, not subscription bills. The calculation does
 not include Batch discounts, partner-cloud pricing, server-tool fees, negotiated
 discounts, or historical price changes. The committed live demo is a static
 snapshot; run `make run` to generate a report using the corrected rates.
+
+### Advisor calls
+
+When a turn calls the advisor tool, `usage.iterations[]` holds an extra
+`type: "advisor_message"` entry on the advisor's own model (for example
+`claude-fable-5-2`). Claude Code leaves it out of the turn's top-level usage, so
+it is read from the iteration itself: priced on the advisor's model and charged
+to that model in the per-model views, not to the model that made the turn. It
+adds tokens and cost (to sessions, days, hours and projects) but no message,
+because an iteration is not a message. It follows the same
+`message.id` + `requestId` deduplication as the turn that carries it, so
+duplicate records and forked transcripts count it once. The advisor entry reports
+no `speed` or `inference_geo`, so those modifiers apply to the host call only.
 
 ### Usage deduplication and date filters
 

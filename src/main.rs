@@ -186,6 +186,7 @@ fn model_id(model: &str) -> String {
 
 fn pricing(model: &str, prompt_tokens: u64) -> Option<(f64, f64, f64, f64, f64)> {
     let (input, output, read) = match model_id(model).as_str() {
+        "claude-fable-5-2" | "claude-mythos-5-2" => (8.0, 40.0, 0.20),
         "claude-fable-5-1" | "claude-mythos-5-1" => (10.0, 50.0, 0.25),
         "claude-fable-5" | "claude-mythos-5" => (10.0, 50.0, 1.0),
         "claude-opus-5-5" => (4.0, 20.0, 0.20),
@@ -248,6 +249,46 @@ fn usage_tokens(u: &Value) -> Tokens {
     tokens
 }
 
+/// One advisor call inside an assistant turn (`usage.iterations[]` with `type: "advisor_message"`).
+/// Claude Code leaves it out of the turn's top-level usage and prices it on the advisor's own model,
+/// so it is carried separately and charged to that model.
+#[derive(Debug, Clone)]
+struct AdvisorUse {
+    model: String,
+    tokens: Tokens,
+    cost_usd: f64,
+}
+
+fn is_advisor_iteration(iteration: &Value) -> bool {
+    iteration.get("type").and_then(Value::as_str) == Some("advisor_message")
+}
+
+fn advisor_uses(u: &Value) -> Vec<AdvisorUse> {
+    let Some(iterations) = u.get("iterations").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    iterations
+        .iter()
+        .filter(|it| is_advisor_iteration(it))
+        .map(|it| {
+            let model = it
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let tokens = usage_tokens(it);
+            // No speed / inference_geo modifier here: those describe the host call, and an advisor
+            // iteration does not report its own.
+            let cost_usd = cost_usd(&tokens, &model);
+            AdvisorUse {
+                model,
+                tokens,
+                cost_usd,
+            }
+        })
+        .collect()
+}
+
 fn usage_cost_usd(u: &Value, model: &str, tokens: &Tokens) -> f64 {
     // Iterations are individual API calls; Haiku's tier applies per call.
     // Only use the breakdown if it reconciles with the recorded totals.
@@ -257,12 +298,14 @@ fn usage_cost_usd(u: &Value, model: &str, tokens: &Tokens) -> f64 {
     if let Some(iterations) = u.get("iterations").and_then(Value::as_array) {
         let mut sum = Tokens::default();
         let mut iteration_cost = 0.0;
-        for iteration in iterations {
+        // Advisor iterations are billed on their own model (see advisor_uses) and are not part of the
+        // top-level totals, so only the host's own calls can reconcile with them.
+        for iteration in iterations.iter().filter(|it| !is_advisor_iteration(it)) {
             let t = usage_tokens(iteration);
             sum.add(&t);
             iteration_cost += cost_usd(&t, model);
         }
-        if !iterations.is_empty() && sum == total {
+        if iterations.iter().any(|it| !is_advisor_iteration(it)) && sum == total {
             cost = iteration_cost;
         }
     }
@@ -303,6 +346,8 @@ mod tests {
             ("claude-sonnet-4-20250514", [3.0, 15.0, 3.75, 6.0, 0.3]),
             ("claude-fable-5", [10.0, 50.0, 12.5, 20.0, 1.0]),
             ("claude-fable-5-1", [10.0, 50.0, 12.5, 20.0, 0.25]),
+            ("claude-fable-5-2", [8.0, 40.0, 10.0, 16.0, 0.2]),
+            ("claude-mythos-5-2", [8.0, 40.0, 10.0, 16.0, 0.2]),
             ("claude-mythos-5", [10.0, 50.0, 12.5, 20.0, 1.0]),
             ("claude-mythos-5-1", [10.0, 50.0, 12.5, 20.0, 0.25]),
             ("claude-haiku-4-5-20251001", [1.0, 5.0, 1.25, 2.0, 0.1]),
@@ -324,6 +369,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn advisor_iterations_are_priced_on_their_own_model_and_exclude_host_calls() {
+        let u = serde_json::json!({"iterations": [
+            {"type": "message", "input_tokens": 5, "output_tokens": 7},
+            {"type": "advisor_message", "model": "claude-fable-5-2",
+             "input_tokens": 200000, "output_tokens": 9000,
+             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            {"type": "advisor_message", "model": "claude-opus-5-5",
+             "input_tokens": 1000, "output_tokens": 100},
+        ]});
+        let a = advisor_uses(&u);
+        assert_eq!(a.len(), 2, "message iterations are not advisor calls");
+        assert_eq!(a[0].model, "claude-fable-5-2");
+        assert_eq!((a[0].tokens.input, a[0].tokens.output), (200000, 9000));
+        assert!((a[0].cost_usd - (200000.0 * 8.0 + 9000.0 * 40.0) / 1e6).abs() < 1e-12);
+        assert!((a[1].cost_usd - (1000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12);
+        assert!(advisor_uses(&serde_json::json!({"input_tokens": 1})).is_empty());
+    }
+
+    #[test]
+    fn advisor_iteration_does_not_stop_host_iterations_reconciling_with_the_totals() {
+        // Two host calls of 60k each: Haiku's tier is per call, so each is cheap even though the
+        // turn's top-level prompt (120k) alone would fall in the expensive tier. The advisor call is
+        // not part of the top-level totals and must not make the reconciliation fail.
+        let u = serde_json::json!({"input_tokens": 120000, "output_tokens": 0, "iterations": [
+            {"type": "message", "input_tokens": 60000, "output_tokens": 0},
+            {"type": "advisor_message", "model": "claude-fable-5-2", "input_tokens": 300000},
+            {"type": "message", "input_tokens": 60000, "output_tokens": 0},
+        ]});
+        let tokens = usage_tokens(&u);
+        let cost = usage_cost_usd(&u, "claude-haiku-5-5", &tokens);
+        assert!((cost - 120000.0 * 0.10 / 1e6).abs() < 1e-12, "got {cost}");
     }
 
     #[test]
@@ -449,7 +528,26 @@ struct Event {
     stop_reason: Option<String>,
     content_types: Vec<String>, // assistant content block types: thinking/text/tool_use
     tools: Vec<String>,         // tool_use names within this assistant turn
+    // `tokens` / `cost_usd` are the host call's usage until `deduplicate_usage` has run; afterwards they
+    // also include `advisor`, with the host-only figures kept in `host_*` for per-model attribution.
     tokens: Tokens,
+    advisor: Vec<AdvisorUse>,
+    host_tokens: Tokens,
+    host_cost_usd: f64,
+}
+
+impl Event {
+    /// Rows for per-model attribution: (model, messages, tokens, cost). The host model gets its own usage
+    /// and one message; each advisor model gets the advisor call's usage and no message.
+    fn model_usage(&self) -> Vec<(Option<String>, u64, Tokens, f64)> {
+        let mut rows = vec![(self.model.clone(), 1, self.host_tokens, self.host_cost_usd)];
+        rows.extend(
+            self.advisor
+                .iter()
+                .map(|a| (Some(a.model.clone()), 0, a.tokens, a.cost_usd)),
+        );
+        rows
+    }
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
@@ -586,6 +684,7 @@ fn deduplicate_usage(sessions: &mut [(PathBuf, SessionMeta, Vec<Event>)]) {
             if e.billing_key.is_some() && e.usage.is_some() {
                 e.tokens = Tokens::default();
                 e.cost_usd = 0.0;
+                e.advisor.clear();
             }
         }
     }
@@ -593,6 +692,19 @@ fn deduplicate_usage(sessions: &mut [(PathBuf, SessionMeta, Vec<Event>)]) {
         let e = &mut sessions[si].2[ei];
         e.tokens = tokens;
         e.cost_usd = usage_cost_usd(&usage, e.model.as_deref().unwrap_or(""), &tokens);
+        e.advisor = advisor_uses(&usage);
+    }
+    // Charge the advisor calls once, on top of the host call: totals (session, day, hour, branch, ...)
+    // include them, while `host_*` keeps the host-only usage for the per-model views.
+    for (_, _, events) in sessions.iter_mut() {
+        for e in events {
+            e.host_tokens = e.tokens;
+            e.host_cost_usd = e.cost_usd;
+            for a in &e.advisor {
+                e.tokens.add(&a.tokens);
+                e.cost_usd += a.cost_usd;
+            }
+        }
     }
 }
 
@@ -662,14 +774,15 @@ fn build_session_days(
         day.messages += 1;
         day.tokens.add(&e.tokens);
         day.cost_usd += e.cost_usd;
-        if let Some(model) = &e.model {
-            if !day.models.contains(model) {
+        for (model, messages, tokens, cost) in e.model_usage() {
+            let Some(model) = model else { continue };
+            if !day.models.contains(&model) {
                 day.models.push(model.clone());
             }
-            let attr = day.by_model.entry(model.clone()).or_default();
-            attr.messages += 1;
-            attr.tokens.add(&e.tokens);
-            attr.cost_usd += e.cost_usd;
+            let attr = day.by_model.entry(model).or_default();
+            attr.messages += messages;
+            attr.tokens.add(&tokens);
+            attr.cost_usd += cost;
         }
         if let Some(skill) = &e.skill {
             *day.by_skill.entry(skill.clone()).or_default() += 1;
@@ -956,6 +1069,12 @@ fn parse_event(v: &Value) -> Option<Event> {
         content_types,
         tools,
         tokens,
+        advisor: v
+            .pointer("/message/usage")
+            .map(advisor_uses)
+            .unwrap_or_default(),
+        host_tokens: tokens,
+        host_cost_usd: event_cost,
     })
 }
 
@@ -1301,27 +1420,30 @@ fn run() -> Result<()> {
         // per-event aggregates (messages, tokens, attribution)
         for e in &events {
             sess_msgs += 1;
-            let model = e.model.as_deref().unwrap_or("");
-            if e.tokens.total() > 0 && pricing(model, 0).is_none() {
-                *unpriced_models.entry(model.to_string()).or_default() += e.tokens.total();
+            for (m, _, t, _) in e.model_usage() {
+                let m = m.unwrap_or_default();
+                if t.total() > 0 && pricing(&m, 0).is_none() {
+                    *unpriced_models.entry(m).or_default() += t.total();
+                }
             }
             let c = e.cost_usd;
             sess_tokens.add(&e.tokens);
             sess_cost += c;
 
-            if let Some(m) = &e.model {
+            for (m, messages, tokens, cost) in e.model_usage() {
+                let Some(m) = m else { continue };
                 sess_models.insert(m.clone(), ());
                 let ms = by_model.entry(m.clone()).or_insert_with(|| ModelStat {
                     name: m.clone(),
                     ..Default::default()
                 });
-                ms.messages += 1;
-                ms.tokens.add(&e.tokens);
-                ms.cost_usd += c;
-                let sm = sess_by_model_attr.entry(m.clone()).or_default();
-                sm.messages += 1;
-                sm.tokens.add(&e.tokens);
-                sm.cost_usd += c;
+                ms.messages += messages;
+                ms.tokens.add(&tokens);
+                ms.cost_usd += cost;
+                let sm = sess_by_model_attr.entry(m).or_default();
+                sm.messages += messages;
+                sm.tokens.add(&tokens);
+                sm.cost_usd += cost;
             }
             if let Some(s) = &e.skill {
                 let ns = by_skill.entry(s.clone()).or_insert_with(|| NamedStat {

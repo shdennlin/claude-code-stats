@@ -18,6 +18,22 @@ def assistant(mid, ts, output=10, request='req', **usage):
                           'cache_read_input_tokens': 1000, **usage}}}
 
 
+def with_advisor(row, model='claude-fable-5-2', input_tokens=200_000, output=9_000):
+    """Mark `row` as a turn whose usage.iterations holds one host call plus one advisor call.
+
+    Claude Code leaves the advisor call out of the top-level usage, so the top level must keep
+    describing only the host call.
+    """
+    u = row['message']['usage']
+    u['iterations'] = [
+        {'type': 'message', 'input_tokens': u['input_tokens'], 'output_tokens': u['output_tokens'],
+         'cache_read_input_tokens': u['cache_read_input_tokens']},
+        {'type': 'advisor_message', 'model': model, 'input_tokens': input_tokens,
+         'output_tokens': output, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0},
+    ]
+    return row
+
+
 class UsageRegression(unittest.TestCase):
     def run_report(self, files, *args):
         with tempfile.TemporaryDirectory(prefix='cc-stats-regression-') as tmp:
@@ -148,6 +164,52 @@ class UsageRegression(unittest.TestCase):
             slices = [s for s in r['session_days'] if s['date'] == day['date']]
             self.assertAlmostEqual(sum(s['cost_usd'] for s in slices), day['cost_usd'])
             self.assertEqual(sum(s['active_sec'] for s in slices), 60)
+
+    def test_advisor_iteration_is_billed_to_its_own_model(self):
+        # host: opus-5, 100 in / 10 out / 1000 cache read; advisor: fable-5-2, 200k in / 9k out.
+        row = with_advisor(assistant('adv', '2026-10-02T01:00:00Z'))
+        r = self.run_report({'p/a.jsonl': [row]})
+        host = 100 * 5 + 10 * 25 + 1000 * .5          # opus-5 rates, per million
+        advisor = 200_000 * 8 + 9_000 * 40            # fable-5-2 rates, per million
+        by_model = {m['name']: m for m in r['by_model']}
+        self.assertAlmostEqual(by_model['claude-opus-5']['cost_usd'], host / 1e6)
+        self.assertAlmostEqual(by_model['claude-fable-5-2']['cost_usd'], advisor / 1e6)
+        self.assertEqual(by_model['claude-fable-5-2']['tokens']['input'], 200_000)
+        self.assertEqual(by_model['claude-fable-5-2']['tokens']['output'], 9_000)
+        self.assertEqual(by_model['claude-fable-5-2']['messages'], 0)   # an iteration is not a message
+        self.assertEqual(by_model['claude-opus-5']['messages'], 1)
+        self.assertAlmostEqual(r['summary']['cost_usd'], (host + advisor) / 1e6)
+        self.assertEqual(r['summary']['tokens']['input'], 100 + 200_000)
+        self.assertEqual(r['summary']['messages'], 1)
+
+    def test_advisor_iteration_is_counted_once_across_duplicate_records(self):
+        # Claude Code writes one record per content block, all carrying the same usage; forks copy them too.
+        rows = [with_advisor(assistant('adv', f'2026-10-02T01:00:0{i}Z')) for i in range(3)]
+        r = self.run_report({'p/a.jsonl': rows, 'p/b.jsonl': rows})
+        by_model = {m['name']: m for m in r['by_model']}
+        self.assertEqual(by_model['claude-fable-5-2']['tokens']['input'], 200_000)
+        self.assertAlmostEqual(by_model['claude-fable-5-2']['cost_usd'], (200_000 * 8 + 9_000 * 40) / 1e6)
+        self.assertEqual(r['summary']['messages'], 6)   # raw event count is unchanged
+
+    def test_advisor_cost_reconciles_across_session_day_and_hour_views(self):
+        row = with_advisor(assistant('adv', '2026-10-02T01:00:00Z'))
+        r = self.run_report({'p/a.jsonl': [row]})
+        total = r['summary']['cost_usd']
+        self.assertAlmostEqual(sum(s['cost_usd'] for s in r['sessions']), total)
+        self.assertAlmostEqual(sum(s['cost_usd'] for s in r['session_days']), total)
+        self.assertAlmostEqual(sum(d['cost_usd'] for d in r['daily']), total)
+        self.assertAlmostEqual(sum(h['cost_usd'] for h in r['by_hour']), total)
+        days_fable = sum(s['by_model'].get('claude-fable-5-2', {}).get('cost_usd', 0) for s in r['session_days'])
+        self.assertAlmostEqual(days_fable, (200_000 * 8 + 9_000 * 40) / 1e6)
+
+    def test_turn_without_advisor_is_unchanged_by_iterations_breakdown(self):
+        row = assistant('plain', '2026-10-02T01:00:00Z')
+        u = row['message']['usage']
+        u['iterations'] = [{'type': 'message', 'input_tokens': 100, 'output_tokens': 10,
+                            'cache_read_input_tokens': 1000}]
+        r = self.run_report({'p/a.jsonl': [row]})
+        self.assertAlmostEqual(r['summary']['cost_usd'], (100 * 5 + 10 * 25 + 1000 * .5) / 1e6)
+        self.assertEqual([m['name'] for m in r['by_model']], ['claude-opus-5'])
 
 
 if __name__ == '__main__':
