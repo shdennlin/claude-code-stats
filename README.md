@@ -77,6 +77,7 @@ cc-stats --from 2026-05-01 --to 2026-05-26
 cc-stats --project myproject -p frontend  # filter (repeatable substring match)
 cc-stats --merge "myproject=Project-A"    # merge matching projects under one label
 cc-stats --gap 30                         # active-time gap threshold (minutes; default 15)
+cc-stats --run-exclude my-notes           # leave a slash command out of the Runs view (repeatable)
 cc-stats --tz "+08:00"                    # force timezone for buckets (default: system local)
 cc-stats --format html                    # html only (default: all = json+csv+html)
 cc-stats --open                           # open report.html after generating
@@ -93,7 +94,7 @@ The HTML viewer also supports merge rules interactively (no rerun needed) — us
 
 | File | Contents |
 |---|---|
-| `data.json` | Full structured report — `summary`, `projects`, `sessions`, `session_days`, `daily`, `by_model`, `by_skill`, `by_plugin`, `by_tool`, `by_mcp_server`, `by_content_type`, `by_stop_reason`, `by_branch`, `by_hour`, `by_weekday`. |
+| `data.json` | Full structured report — `summary`, `projects`, `sessions`, `session_days`, `daily`, `by_model`, `by_skill`, `by_plugin`, `by_tool`, `by_mcp_server`, `by_content_type`, `by_stop_reason`, `by_branch`, `by_hour`, `by_weekday`, plus the Runs view: `runs`, `by_trigger`, `runs_weekly`, `runs_weekly_total`. |
 | `daily.csv` / `projects.csv` / `sessions.csv` | Flat CSVs for spreadsheet drilling. |
 | `report.html` | Self-contained interactive viewer (data embedded). Open in any browser. Filters, charts, sortable tables, drilldown, localStorage-persisted state. |
 
@@ -112,6 +113,12 @@ The HTML viewer also supports merge rules interactively (no rerun needed) — us
 | **Tools** | Walks `assistant.content[].tool_use.name`. MCP tools also grouped by server (`mcp__<server>__*`). |
 | **Content composition** | thinking / text / tool_use block ratio. |
 | **Stop reason** | `end_turn` / `tool_use` / `stop_sequence` distribution. |
+| **Run** | One human prompt until the next, answered by at least one assistant message. Main sessions only: subagent files and sidechain lines are part of their parent's run. A session resumed into a new file counts each prompt once. |
+| **Run duration** | Active time of the run: every gap between two consecutive events is capped at `--gap`, so sleep, permission waits and left-open sessions do not inflate it. |
+| **Trigger** | What started the run, discovered from the transcript, never configured: the slash command you typed, else the first Skill the agent invoked, else `(plain prompt)`. Built-in local commands (`/compact`, `/model`, ...) are not runs; add more with `--run-exclude`. |
+| **Interrupts** | `[Request interrupted by user]` markers inside a run, and whether the run ended on one. An observation of where you stepped in, not a score. |
+| **runner / new** | `runner` = at least 5 runs and 30% of them over 10 minutes. `new` = first seen in the last 14 days of the data. |
+| **Run parallelism** | Per week, agent hours / wall-clock hours with any agent working (and the peak number at once), from the run intervals of the main sessions. `*_all` fields count subagents too, as threads that are working: while a main session has a subagent working, its own waiting time is not counted, so one subagent running alone is 1, not 2, and two at once are 2. Also `subagent_hours` and `peak_subagents`. A segment belongs to the week it starts in. |
 | **Git branch** | Per-branch active / messages / cost. |
 | **Session titles** | From `ai-title` / `custom-title` events (custom overrides AI-generated). |
 
