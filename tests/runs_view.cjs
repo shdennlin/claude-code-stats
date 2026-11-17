@@ -204,4 +204,16 @@ assert.equal(registry.get('runs-subagents').disabled, true, 'toggle is disabled 
 api.DATA.runs_weekly_total = withSubs; registry.clear(); api.initRuns();
 assert.equal(registry.get('runs-subagents').disabled, false);
 
+// ---- names come from transcripts: they are shown as text, never parsed as markup ----
+const EVIL = '</script><img src=x onerror=alert(1)>';
+api.DATA.runs_weekly_total = withSubs;
+api.DATA.runs.push({...mk(3, EVIL, 400), skills: [EVIL + '2']});
+open(day(0), day(18)); api.state.runsMin = 1; api.state.runsGroup = 'trigger'; api.state.runsPinned = EVIL;
+reset(); api.renderRuns();
+assert.ok(rowsOf().includes(EVIL), 'table shows the name verbatim as text');
+assert.ok(registry.get('runs-trend').textContent.includes(EVIL), 'chart title shows it verbatim as text');
+assert.ok(!html.slice(html.indexOf('// ---------- Runs ----------'), html.indexOf('function exportFiltered')).match(/innerHTML|insertAdjacentHTML|document\.write/), 'the Runs code never builds markup from data');
+api.state.runsGroup = 'skill'; reset(); api.renderRuns();
+assert.ok(rowsOf().includes(EVIL + '2'), 'skill names too');
+
 console.log('Runs view: aggregation, filters, charts and table behave.');

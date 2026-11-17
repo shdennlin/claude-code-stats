@@ -17,6 +17,20 @@ fn tz() -> &'static FixedOffset {
 
 const REPORT_HTML_TEMPLATE: &str = include_str!("../templates/report.html");
 
+/// JSON for embedding inside a `<script>` element. Names in the data come from transcripts (project,
+/// branch, command and skill names, titles), and `serde_json` leaves `<` alone, so a name containing
+/// `</script>` would end the element and let the rest run as markup. These characters only ever occur
+/// inside JSON string literals, where `\uXXXX` is the same character, so nothing is lost. U+2028 and
+/// U+2029 are escaped as well: they were line terminators inside JS string literals before ES2019.
+fn json_for_script<T: Serialize>(value: &T) -> Result<String> {
+    Ok(serde_json::to_string(value)?
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029"))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "cc-stats", about = "Claude Code usage analytics")]
 struct Args {
@@ -2424,7 +2438,7 @@ fn run() -> Result<()> {
     if want_html {
         let html = REPORT_HTML_TEMPLATE.replace(
             "/*__CC_STATS_DATA__*/null",
-            &serde_json::to_string(&report)?,
+            &json_for_script(&report)?,
         );
         let p = args.out.join("report.html");
         fs::write(&p, &html)?;
@@ -2835,6 +2849,14 @@ mod run_tests {
             Event { sidechain: true, ..ev(Role::Other, 150) }, Event { sidechain: true, ..assistant(100 + 9000, &[]) },
         ];
         assert_eq!(agent_segments(&evs, CAP), vec![(0, 100), (100, 1000)]);
+    }
+
+    #[test]
+    fn json_embedded_in_a_script_element_cannot_end_it() {
+        let v = json!({"name": "</script><!--&\u{2028}\u{2029}>", "n": 1});
+        let out = json_for_script(&v).unwrap();
+        assert!(!out.contains(['<', '>', '&', '\u{2028}', '\u{2029}']), "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), v, "escapes are plain JSON, nothing is lost");
     }
 
     #[test]

@@ -166,5 +166,45 @@ class RunsRegression(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
+
+EVIL = '</script><img src=x onerror=alert(1)>'
+
+
+class ReportEmbedding(unittest.TestCase):
+    """Names come from transcripts, so they must not be able to end the <script> element they are embedded in."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix='cc-stats-embed-')
+        base = Path(cls.tmp.name)
+        rows = [command('2026-11-02T10:00:00Z', 'e1', EVIL, '/fixture/<x>'), assistant('2026-11-02T10:00:30Z', [EVIL + '2\u2028\u2029'], '/fixture/<x>')]
+        path = base / 'projects/proj-x/s.jsonl'
+        path.parent.mkdir(parents=True)
+        path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        subprocess.run([str(BIN), '--dir', str(base / 'projects'), '--out', str(base / 'out'), '--all', '--tz', 'UTC'],
+                       capture_output=True, text=True, check=True)
+        cls.html = (base / 'out/report.html').read_text()
+        cls.template = (ROOT / 'templates/report.html').read_text()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_a_hostile_name_cannot_end_the_script_element(self):
+        self.assertEqual(self.html.count('</script'), self.template.count('</script'))
+        self.assertNotIn('<img src=x onerror', self.html)
+        self.assertEqual(self.html.count('<!--'), self.template.count('<!--'))
+
+    def test_the_embedded_data_still_round_trips_exactly(self):
+        i = self.html.index('const DATA = ') + len('const DATA = ')
+        data, _ = json.JSONDecoder().raw_decode(self.html[i:])
+        self.assertEqual(data['runs'][0]['trigger'], EVIL)
+        self.assertEqual(data['runs'][0]['skills'], [EVIL + '2\u2028\u2029'])
+
+    def test_line_separators_are_escaped_too(self):
+        # U+2028 / U+2029 were line terminators in JS string literals before ES2019
+        self.assertNotIn('\u2028', self.html.split('const DATA = ', 1)[1].split('const STORAGE_KEY', 1)[0])
+
+
 if __name__ == '__main__':
     unittest.main()
