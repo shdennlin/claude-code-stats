@@ -17,6 +17,20 @@ fn tz() -> &'static FixedOffset {
 
 const REPORT_HTML_TEMPLATE: &str = include_str!("../templates/report.html");
 
+/// JSON for embedding inside a `<script>` element. Names in the data come from transcripts (project,
+/// branch, command and skill names, titles), and `serde_json` leaves `<` alone, so a name containing
+/// `</script>` would end the element and let the rest run as markup. These characters only ever occur
+/// inside JSON string literals, where `\uXXXX` is the same character, so nothing is lost. U+2028 and
+/// U+2029 are escaped as well: they were line terminators inside JS string literals before ES2019.
+fn json_for_script<T: Serialize>(value: &T) -> Result<String> {
+    Ok(serde_json::to_string(value)?
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029"))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "cc-stats", about = "Claude Code usage analytics")]
 struct Args {
@@ -73,6 +87,11 @@ struct Args {
     /// Scan ALL history (disables --days default).
     #[arg(long)]
     all: bool,
+
+    /// Slash command to leave out of the runs view (repeatable, case-insensitive), on top of the
+    /// built-in local commands such as /compact and /model. E.g. --run-exclude my-notes
+    #[arg(long, value_name = "COMMAND")]
+    run_exclude: Vec<String>,
 
     /// Strip PII for public demo: clears session.file / project.cwd; replaces
     /// session titles with "Session NNNN"; replaces non-universal git branches
@@ -534,6 +553,22 @@ struct Event {
     advisor: Vec<AdvisorUse>,
     host_tokens: Tokens,
     host_cost_usd: f64,
+    // Run reconstruction (see `build_runs`): what this transcript line is, not what it cost.
+    role: Role,
+    command: Option<String>, // slash command typed in a human prompt, e.g. "spectra-apply"
+    skills: Vec<String>,     // Skill tool_use inputs in this assistant message
+    interrupted: bool,       // "[Request interrupted by user...]" marker
+    sidechain: bool,         // subagent traffic: never part of a main-session run
+    uuid: Option<String>,
+}
+
+/// Role of a transcript line for run reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Other,       // attachments, system events, metadata: no bearing on a run
+    Assistant,   // the agent working
+    HumanPrompt, // starts a run
+    UserOther,   // tool results, interrupt markers, task notifications: the run continues
 }
 
 impl Event {
@@ -964,6 +999,10 @@ struct Report {
     by_branch: Vec<BranchStat>,
     by_hour: Vec<HourStat>,
     by_weekday: Vec<WeekdayStat>,
+    runs: Vec<Run>,                  // one per human prompt that the agent answered
+    by_trigger: Vec<TriggerStat>,    // runs grouped by slash command / first skill, auto-discovered
+    runs_weekly: Vec<WeeklyTrigger>, // week x trigger
+    runs_weekly_total: Vec<WeeklyTotal>, // week: agent hours, wall-clock hours, parallelism
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
@@ -987,6 +1026,73 @@ fn decode_project_folder(name: &str) -> String {
     name.replace('-', "/")
 }
 
+/// Text of a user message: the string itself, or the text blocks joined.
+fn user_text(content: &Value) -> String {
+    match content {
+        Value::String(t) => t.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// `<command-name>/spectra-apply</command-name>` -> "spectra-apply".
+fn command_name(text: &str) -> Option<String> {
+    let rest = &text[text.find("<command-name>")? + "<command-name>".len()..];
+    let name = rest[..rest.find("</command-name>")?]
+        .trim()
+        .trim_start_matches('/');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Classify a user line. Returns (role, interrupted).
+fn classify_user(v: &Value) -> (Role, bool) {
+    let content = v.pointer("/message/content").unwrap_or(&Value::Null);
+    let text = user_text(content);
+    let interrupted = text.trim_start().starts_with("[Request interrupted");
+    let meta = v.get("isMeta").and_then(Value::as_bool).unwrap_or(false);
+    if meta || interrupted {
+        return (Role::UserOther, interrupted);
+    }
+    match content {
+        Value::String(t) => {
+            let machine = t.starts_with("<task-notification") || t.starts_with("<local-command");
+            (
+                if machine {
+                    Role::UserOther
+                } else {
+                    Role::HumanPrompt
+                },
+                false,
+            )
+        }
+        Value::Array(blocks) => {
+            let kind = |k: &str| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some(k))
+            };
+            if kind("tool_result") {
+                return (Role::UserOther, false);
+            }
+            let human_origin = v.pointer("/origin/kind").and_then(Value::as_str) == Some("human");
+            let typed = human_origin || kind("text") || kind("image");
+            (
+                if typed {
+                    Role::HumanPrompt
+                } else {
+                    Role::UserOther
+                },
+                false,
+            )
+        }
+        _ => (Role::UserOther, false),
+    }
+}
+
 fn parse_event(v: &Value) -> Option<Event> {
     let ts = v.get("timestamp")?.as_str()?;
     let dt = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
@@ -998,6 +1104,7 @@ fn parse_event(v: &Value) -> Option<Event> {
     let mut stop_reason = None;
     let mut content_types: Vec<String> = Vec::new();
     let mut tools: Vec<String> = Vec::new();
+    let mut skills: Vec<String> = Vec::new();
     let skill = v
         .get("attributionSkill")
         .and_then(|x| x.as_str())
@@ -1025,6 +1132,13 @@ fn parse_event(v: &Value) -> Option<Event> {
                         if ct == "tool_use" {
                             if let Some(name) = c.get("name").and_then(|x| x.as_str()) {
                                 tools.push(name.to_string());
+                                if name == "Skill" {
+                                    if let Some(sk) =
+                                        c.pointer("/input/skill").and_then(Value::as_str)
+                                    {
+                                        skills.push(sk.to_string());
+                                    }
+                                }
                             }
                         }
                     }
@@ -1056,7 +1170,32 @@ fn parse_event(v: &Value) -> Option<Event> {
     } else {
         None
     };
+    let sidechain = v
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (role, interrupted, command) = match typ {
+        "assistant" => (Role::Assistant, false, None),
+        "user" => {
+            let (role, interrupted) = classify_user(v);
+            let command = (role == Role::HumanPrompt)
+                .then(|| {
+                    v.pointer("/message/content")
+                        .and_then(Value::as_str)
+                        .and_then(command_name)
+                })
+                .flatten();
+            (role, interrupted, command)
+        }
+        _ => (Role::Other, false, None),
+    };
     Some(Event {
+        role,
+        command,
+        skills,
+        interrupted,
+        sidechain,
+        uuid: v.get("uuid").and_then(Value::as_str).map(String::from),
         billing_key,
         usage: v.pointer("/message/usage").cloned(),
         cost_usd: event_cost,
@@ -1225,6 +1364,515 @@ fn matches_project(name: &str, cwd: &str, filters: &[String]) -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Runs. One run is one stretch of agent work: a human prompt until the next human prompt.
+// The trigger (typed slash command, else the first Skill the agent invoked, else a plain prompt)
+// is discovered from the transcript itself, so a new skill shows up without any configuration.
+// ---------------------------------------------------------------------------------------------
+
+const PLAIN_PROMPT: &str = "(plain prompt)";
+
+/// Built-in commands the harness answers locally. They are not agent work, so they never form a
+/// run. Extendable with `--run-exclude`. (`goal`, `spectra-apply` and friends are agent work.)
+const LOCAL_COMMANDS: &[&str] = &[
+    "compact",
+    "clear",
+    "model",
+    "plugin",
+    "reload-plugins",
+    "mcp",
+    "config",
+    "help",
+    "status",
+    "resume",
+    "effort",
+    "advisor",
+    "agents",
+    "hooks",
+    "permissions",
+    "login",
+    "logout",
+    "cost",
+    "context",
+    "memory",
+    "doctor",
+    "exit",
+    "ide",
+    "theme",
+    "vim",
+    "usage",
+    "rewind",
+    "export",
+    "add-dir",
+    "color",
+    "rename",
+    "fast",
+    "stats",
+];
+
+#[derive(Debug, Clone, Serialize)]
+struct Run {
+    date: String, // scan-tz date of the prompt
+    start: i64,   // prompt time, unix seconds
+    dur_sec: u64, // active time: every gap between consecutive events is capped at `--gap`
+    trigger: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skills: Vec<String>, // every Skill the agent invoked during the run
+    interrupts: u32, // "[Request interrupted by user]" markers inside the run
+    ended_by_interrupt: bool,
+    project: String,
+    #[serde(skip)]
+    uuid: Option<String>,
+    #[serde(skip)]
+    events: usize,
+}
+
+struct RunBuild {
+    run: Run,
+    segs: Vec<(i64, i64)>, // active segments in unix seconds, for concurrency
+    session: String,       // "<project folder>/<session id>": ties subagent work to its parent run
+}
+
+/// Active time of one subagent transcript, tied to the main session that spawned it.
+struct SubWork {
+    session: String,
+    segs: Vec<(i64, i64)>,
+}
+
+#[derive(Default)]
+struct RunAcc {
+    uuid: Option<String>,
+    command: Option<String>,
+    times: Vec<i64>,
+    skills: Vec<String>,
+    interrupts: u32,
+    ended_by_interrupt: bool,
+    assistants: usize,
+}
+
+/// Rebuild the runs of one transcript. Pure: no timezone, no globals.
+fn build_runs(events: &[Event], gap_sec: i64, exclude: &[String]) -> Vec<RunBuild> {
+    let mut out = Vec::new();
+    let mut cur: Option<RunAcc> = None;
+    let finish = |acc: Option<RunAcc>, out: &mut Vec<RunBuild>| {
+        let Some(a) = acc else { return };
+        if a.assistants == 0 {
+            return; // nothing answered: a local command, or a prompt that was never run
+        }
+        let command = a.command.filter(|c| !c.is_empty());
+        if let Some(c) = &command {
+            let c = c.to_lowercase();
+            if LOCAL_COMMANDS.contains(&c.as_str()) || exclude.iter().any(|x| x.to_lowercase() == c)
+            {
+                return;
+            }
+        }
+        let trigger = command
+            .clone()
+            .or_else(|| a.skills.first().cloned())
+            .unwrap_or_else(|| PLAIN_PROMPT.to_string());
+        let mut dur = 0u64;
+        let mut segs = Vec::new();
+        for w in a.times.windows(2) {
+            let step = (w[1] - w[0]).clamp(0, gap_sec);
+            dur += step as u64;
+            segs.push((w[0], w[0] + step));
+        }
+        let mut skills: Vec<String> = Vec::new();
+        for s in a.skills {
+            if s != trigger && !skills.contains(&s) {
+                skills.push(s);
+            }
+        }
+        let start = a.times[0];
+        out.push(RunBuild {
+            run: Run {
+                date: String::new(),
+                start,
+                dur_sec: dur,
+                trigger,
+                skills,
+                interrupts: a.interrupts,
+                ended_by_interrupt: a.ended_by_interrupt,
+                project: String::new(),
+                uuid: a.uuid,
+                events: a.times.len(),
+            },
+            segs,
+            session: String::new(),
+        });
+    };
+    for e in events {
+        if e.sidechain || e.role == Role::Other {
+            continue;
+        }
+        let t = e.dt_utc.timestamp();
+        if e.role == Role::HumanPrompt {
+            finish(cur.take(), &mut out);
+            cur = Some(RunAcc {
+                uuid: e.uuid.clone(),
+                command: e.command.clone(),
+                times: vec![t],
+                ..Default::default()
+            });
+            continue;
+        }
+        let Some(a) = cur.as_mut() else { continue };
+        a.times.push(t);
+        a.ended_by_interrupt = e.interrupted;
+        if e.interrupted {
+            a.interrupts += 1;
+        }
+        if e.role == Role::Assistant {
+            a.assistants += 1;
+            a.skills.extend(e.skills.iter().cloned());
+        }
+    }
+    finish(cur.take(), &mut out);
+    out
+}
+
+/// A resumed session copies its history into a new file, so the same prompt can appear twice.
+/// Keep the copy that saw more of the run.
+fn dedupe_runs(runs: Vec<RunBuild>) -> Vec<RunBuild> {
+    let mut by_uuid: BTreeMap<String, usize> = BTreeMap::new();
+    let mut out: Vec<RunBuild> = Vec::new();
+    for r in runs {
+        match r.run.uuid.clone() {
+            Some(u) => match by_uuid.get(&u) {
+                Some(&i) => {
+                    if r.run.events > out[i].run.events {
+                        out[i] = r;
+                    }
+                }
+                None => {
+                    by_uuid.insert(u, out.len());
+                    out.push(r);
+                }
+            },
+            None => out.push(r),
+        }
+    }
+    out
+}
+
+/// Nearest-rank percentile on an ascending slice. The viewer uses the same rule.
+fn pct(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)]
+}
+
+fn week_start(date: &str) -> String {
+    NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|d| {
+            (d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64)).to_string()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Serialize)]
+struct TriggerStat {
+    name: String,
+    runs: u64,
+    median_sec: u64,
+    p90_sec: u64,
+    p99_sec: u64,
+    max_sec: u64,
+    hours: f64,
+    over_10m_pct: f64,
+    interrupts: u64,
+    interrupts_per_hour: f64,
+    first_seen: String,
+    last_seen: String,
+    is_new: bool, // first seen in the last 14 days of the data
+    runner: bool, // looks like "let it run": >= 5 runs and >= 30% of them over 10 minutes
+}
+
+#[derive(Debug, Serialize)]
+struct WeeklyTrigger {
+    week: String,
+    trigger: String,
+    runs: u64,
+    median_sec: u64,
+    p90_sec: u64,
+    hours: f64,
+    interrupts: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct WeeklyTotal {
+    week: String,
+    runs: u64,
+    hours: f64,
+    union_hours: f64, // wall-clock hours with at least one agent working
+    avg_parallel: f64,
+    peak_parallel: u32,
+    // The same, counting subagents. `*_all` counts threads that are working: while a main session
+    // has a subagent working, its own waiting time is not counted, so one subagent running alone is
+    // 1, not 2.
+    subagent_hours: f64,
+    peak_subagents: u32,
+    hours_all: f64,
+    union_hours_all: f64,
+    avg_parallel_all: f64,
+    peak_parallel_all: u32,
+}
+
+fn summarize_triggers(runs: &[Run]) -> Vec<TriggerStat> {
+    let latest = runs.iter().map(|r| r.date.as_str()).max().unwrap_or("");
+    let mut groups: BTreeMap<&str, Vec<&Run>> = BTreeMap::new();
+    for r in runs {
+        groups.entry(r.trigger.as_str()).or_default().push(r);
+    }
+    let mut out: Vec<TriggerStat> = groups
+        .into_iter()
+        .map(|(name, rs)| {
+            let mut d: Vec<u64> = rs.iter().map(|r| r.dur_sec).collect();
+            d.sort_unstable();
+            let hours = d.iter().sum::<u64>() as f64 / 3600.0;
+            let interrupts: u64 = rs.iter().map(|r| r.interrupts as u64).sum();
+            let over = d.iter().filter(|&&x| x > 600).count() as f64 * 100.0 / d.len() as f64;
+            let first = rs
+                .iter()
+                .map(|r| r.date.as_str())
+                .min()
+                .unwrap_or("")
+                .to_string();
+            let last = rs
+                .iter()
+                .map(|r| r.date.as_str())
+                .max()
+                .unwrap_or("")
+                .to_string();
+            let is_new = match (
+                NaiveDate::parse_from_str(&first, "%Y-%m-%d"),
+                NaiveDate::parse_from_str(latest, "%Y-%m-%d"),
+            ) {
+                (Ok(f), Ok(l)) => (l - f).num_days() <= 14,
+                _ => false,
+            };
+            TriggerStat {
+                name: name.to_string(),
+                runs: d.len() as u64,
+                median_sec: pct(&d, 0.5),
+                p90_sec: pct(&d, 0.9),
+                p99_sec: pct(&d, 0.99),
+                max_sec: *d.last().unwrap_or(&0),
+                hours,
+                over_10m_pct: over,
+                interrupts,
+                interrupts_per_hour: if hours > 0.0 {
+                    interrupts as f64 / hours
+                } else {
+                    0.0
+                },
+                first_seen: first,
+                last_seen: last,
+                is_new,
+                runner: d.len() >= 5 && over >= 30.0,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.hours
+            .partial_cmp(&a.hours)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+fn weekly_triggers(runs: &[Run]) -> Vec<WeeklyTrigger> {
+    let mut groups: BTreeMap<(String, &str), Vec<&Run>> = BTreeMap::new();
+    for r in runs {
+        groups
+            .entry((week_start(&r.date), r.trigger.as_str()))
+            .or_default()
+            .push(r);
+    }
+    groups
+        .into_iter()
+        .map(|((week, trigger), rs)| {
+            let mut d: Vec<u64> = rs.iter().map(|r| r.dur_sec).collect();
+            d.sort_unstable();
+            WeeklyTrigger {
+                week,
+                trigger: trigger.to_string(),
+                runs: d.len() as u64,
+                median_sec: pct(&d, 0.5),
+                p90_sec: pct(&d, 0.9),
+                hours: d.iter().sum::<u64>() as f64 / 3600.0,
+                interrupts: rs.iter().map(|r| r.interrupts as u64).sum(),
+            }
+        })
+        .collect()
+}
+
+/// Gap-capped active segments of one transcript, from every user/assistant line (a subagent's own
+/// lines are all sidechain, so unlike `build_runs` nothing is skipped on that account).
+fn agent_segments(events: &[Event], gap_sec: i64) -> Vec<(i64, i64)> {
+    let times: Vec<i64> = events
+        .iter()
+        .filter(|e| e.role != Role::Other)
+        .map(|e| e.dt_utc.timestamp())
+        .collect();
+    times
+        .windows(2)
+        .map(|w| (w[0], w[0] + (w[1] - w[0]).clamp(0, gap_sec)))
+        .filter(|(a, z)| z > a)
+        .collect()
+}
+
+/// `<project>/<session id>/subagents/agent-x.jsonl` -> the session id of the main transcript.
+fn subagent_session(path: &Path) -> Option<String> {
+    let parts: Vec<_> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let i = parts.iter().position(|p| p == "subagents")?;
+    (i > 0).then(|| parts[i - 1].clone())
+}
+
+/// Sorted, non-overlapping union of intervals.
+fn merge_intervals(mut v: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    v.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for (a, z) in v {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(z),
+            _ => out.push((a, z)),
+        }
+    }
+    out
+}
+
+/// `seg` with every part covered by `cut` (sorted, non-overlapping) removed.
+fn subtract_intervals(seg: (i64, i64), cut: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    let mut from = seg.0;
+    for &(a, z) in cut {
+        if z <= from {
+            continue;
+        }
+        if a >= seg.1 {
+            break;
+        }
+        if a > from {
+            out.push((from, a));
+        }
+        from = from.max(z);
+    }
+    if from < seg.1 {
+        out.push((from, seg.1));
+    }
+    out
+}
+
+/// (active seconds summed over segments, seconds with at least one open, most open at once)
+fn sweep(segs: &[(i64, i64)]) -> (i64, i64, i32) {
+    let mut points: Vec<(i64, i32)> = Vec::new();
+    let mut total = 0i64;
+    for &(a, z) in segs {
+        if z > a {
+            points.push((a, 1));
+            points.push((z, -1));
+            total += z - a;
+        }
+    }
+    // an end sorts before a start at the same instant, so back-to-back segments do not overlap
+    points.sort_unstable();
+    let (mut open, mut peak, mut union, mut last) = (0i32, 0i32, 0i64, 0i64);
+    for (t, d) in points {
+        if open > 0 {
+            union += t - last;
+        }
+        open += d;
+        peak = peak.max(open);
+        last = t;
+    }
+    (total, union, peak.max(0))
+}
+
+fn week_of_epoch(t: i64, tz: &FixedOffset) -> String {
+    DateTime::from_timestamp(t, 0)
+        .map(|d| week_start(&d.with_timezone(tz).format("%Y-%m-%d").to_string()))
+        .unwrap_or_default()
+}
+
+#[derive(Default)]
+struct WeekSegs {
+    runs: u64,
+    main: Vec<(i64, i64)>, // main-session runs
+    sub: Vec<(i64, i64)>,  // subagents
+    all: Vec<(i64, i64)>, // threads actually working: main time is dropped while its own subagents work
+}
+
+/// Per week: agent hours, wall-clock hours with any agent working, and how many ran at once, for the
+/// main sessions alone and again counting subagents. A segment belongs to the week it starts in.
+fn weekly_totals(builds: &[RunBuild], subs: &[SubWork], tz: &FixedOffset) -> Vec<WeeklyTotal> {
+    let mut cut: BTreeMap<&str, Vec<(i64, i64)>> = BTreeMap::new();
+    for s in subs {
+        cut.entry(s.session.as_str())
+            .or_default()
+            .extend(s.segs.iter().copied());
+    }
+    let cut: BTreeMap<&str, Vec<(i64, i64)>> = cut
+        .into_iter()
+        .map(|(k, v)| (k, merge_intervals(v)))
+        .collect();
+    let mut weeks: BTreeMap<String, WeekSegs> = BTreeMap::new();
+    for b in builds {
+        weeks.entry(week_start(&b.run.date)).or_default().runs += 1;
+        let parent_cut = cut.get(b.session.as_str());
+        for &(a, z) in b.segs.iter().filter(|(a, z)| z > a) {
+            let w = weeks.entry(week_of_epoch(a, tz)).or_default();
+            w.main.push((a, z));
+            match parent_cut {
+                Some(c) => w.all.extend(subtract_intervals((a, z), c)),
+                None => w.all.push((a, z)),
+            }
+        }
+    }
+    for s in subs {
+        for &(a, z) in s.segs.iter().filter(|(a, z)| z > a) {
+            let w = weeks.entry(week_of_epoch(a, tz)).or_default();
+            w.sub.push((a, z));
+            w.all.push((a, z));
+        }
+    }
+    let hours = |secs: i64| secs as f64 / 3600.0;
+    let avg = |total: i64, union: i64| {
+        if union > 0 {
+            total as f64 / union as f64
+        } else {
+            0.0
+        }
+    };
+    weeks
+        .into_iter()
+        .map(|(week, w)| {
+            let (m_tot, m_uni, m_peak) = sweep(&w.main);
+            let (a_tot, a_uni, a_peak) = sweep(&w.all);
+            let (s_tot, _, s_peak) = sweep(&w.sub);
+            WeeklyTotal {
+                week,
+                runs: w.runs,
+                hours: hours(m_tot),
+                union_hours: hours(m_uni),
+                avg_parallel: avg(m_tot, m_uni),
+                peak_parallel: m_peak as u32,
+                subagent_hours: hours(s_tot),
+                peak_subagents: s_peak as u32,
+                hours_all: hours(a_tot),
+                union_hours_all: hours(a_uni),
+                avg_parallel_all: avg(a_tot, a_uni),
+                peak_parallel_all: a_peak as u32,
+            }
+        })
+        .collect()
+}
+
 fn run() -> Result<()> {
     let args = Args::parse();
     let parsed_tz = parse_tz(&args.tz).context("--tz parse")?;
@@ -1323,6 +1971,66 @@ fn run() -> Result<()> {
             *entry = (apply_merge(&meta.cwd, &merges), Some(meta.cwd.clone()));
         }
     }
+    // Runs come from main-session transcripts only (a subagent's work is part of its parent's run),
+    // filtered by the same project and date window as the sessions.
+    let mut run_builds: Vec<RunBuild> = Vec::new();
+    for (path, meta, events) in &loaded {
+        if events.is_empty() || path.components().any(|c| c.as_os_str() == "subagents") {
+            continue;
+        }
+        let (project_name, _) = folder_projects.get(&folder_key(path)).unwrap().clone();
+        if !matches_project(&project_name, &meta.cwd, &args.project) {
+            continue;
+        }
+        for mut b in build_runs(events, gap_sec as i64, &args.run_exclude) {
+            let Some(start) = DateTime::from_timestamp(b.run.start, 0) else {
+                continue;
+            };
+            b.run.date = date_key(start);
+            if !within_range(&b.run.date, &from, &to) {
+                continue;
+            }
+            b.run.project = project_name.clone();
+            b.session = format!(
+                "{}/{}",
+                folder_key(path),
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            );
+            run_builds.push(b);
+        }
+    }
+    // Subagent transcripts: same project and date filters, tied to the session that spawned them.
+    let mut sub_work: Vec<SubWork> = Vec::new();
+    for (path, meta, events) in &loaded {
+        let Some(parent) = subagent_session(path) else {
+            continue;
+        };
+        if events.is_empty() {
+            continue;
+        }
+        let (project_name, _) = folder_projects.get(&folder_key(path)).unwrap().clone();
+        if !matches_project(&project_name, &meta.cwd, &args.project) {
+            continue;
+        }
+        let segs: Vec<(i64, i64)> = agent_segments(events, gap_sec as i64)
+            .into_iter()
+            .filter(|&(a, _)| {
+                DateTime::from_timestamp(a, 0)
+                    .is_some_and(|d| within_range(&date_key(d), &from, &to))
+            })
+            .collect();
+        if !segs.is_empty() {
+            sub_work.push(SubWork {
+                session: format!("{}/{}", folder_key(path), parent),
+                segs,
+            });
+        }
+    }
+    let mut run_builds = dedupe_runs(run_builds);
+    run_builds.sort_by_key(|b| b.run.start);
+
     for (jsonl_path, sess_meta, mut events) in loaded {
         let folder = folder_key(&jsonl_path);
         let cwd = &sess_meta.cwd;
@@ -1803,7 +2511,14 @@ fn run() -> Result<()> {
         by_branch: by_branch_v,
         by_hour: by_hour_v,
         by_weekday: by_weekday_v,
+        by_trigger: Vec::new(),
+        runs_weekly: Vec::new(),
+        runs_weekly_total: weekly_totals(&run_builds, &sub_work, tz()),
+        runs: Vec::new(),
     };
+    report.runs = run_builds.into_iter().map(|b| b.run).collect();
+    report.by_trigger = summarize_triggers(&report.runs);
+    report.runs_weekly = weekly_triggers(&report.runs);
 
     if args.anonymize {
         anonymize_report(&mut report);
@@ -1827,10 +2542,8 @@ fn run() -> Result<()> {
     }
 
     if want_html {
-        let html = REPORT_HTML_TEMPLATE.replace(
-            "/*__CC_STATS_DATA__*/null",
-            &serde_json::to_string(&report)?,
-        );
+        let html =
+            REPORT_HTML_TEMPLATE.replace("/*__CC_STATS_DATA__*/null", &json_for_script(&report)?);
         let p = args.out.join("report.html");
         fs::write(&p, &html)?;
         println!("wrote {}", p.display());
@@ -2014,5 +2727,486 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ev(role: Role, t: i64) -> Event {
+        Event {
+            billing_key: None,
+            usage: None,
+            cost_usd: 0.0,
+            dt_utc: DateTime::from_timestamp(t, 0).unwrap(),
+            model: None,
+            skill: None,
+            plugin: None,
+            git_branch: None,
+            stop_reason: None,
+            content_types: vec![],
+            tools: vec![],
+            tokens: Tokens::default(),
+            advisor: vec![],
+            host_tokens: Tokens::default(),
+            host_cost_usd: 0.0,
+            role,
+            command: None,
+            skills: vec![],
+            interrupted: false,
+            sidechain: false,
+            uuid: None,
+        }
+    }
+    fn prompt(t: i64, uuid: &str) -> Event {
+        Event {
+            uuid: Some(uuid.into()),
+            ..ev(Role::HumanPrompt, t)
+        }
+    }
+    fn typed(t: i64, cmd: &str) -> Event {
+        Event {
+            command: Some(cmd.into()),
+            uuid: Some(format!("u{t}")),
+            ..ev(Role::HumanPrompt, t)
+        }
+    }
+    fn assistant(t: i64, skills: &[&str]) -> Event {
+        Event {
+            skills: skills.iter().map(|s| s.to_string()).collect(),
+            ..ev(Role::Assistant, t)
+        }
+    }
+    fn interrupt(t: i64) -> Event {
+        Event {
+            interrupted: true,
+            ..ev(Role::UserOther, t)
+        }
+    }
+    const CAP: i64 = 900;
+
+    #[test]
+    fn a_run_spans_prompt_to_last_event_before_the_next_prompt() {
+        let evs = vec![
+            prompt(0, "a"),
+            assistant(10, &[]),
+            ev(Role::UserOther, 20),
+            assistant(30, &[]),
+            prompt(100, "b"),
+            assistant(110, &[]),
+        ];
+        let r = build_runs(&evs, CAP, &[]);
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            (r[0].run.dur_sec, r[0].run.trigger.as_str()),
+            (30, PLAIN_PROMPT)
+        );
+        assert_eq!(r[1].run.dur_sec, 10);
+    }
+
+    #[test]
+    fn idle_gaps_are_capped_not_counted_in_full() {
+        let evs = vec![
+            prompt(0, "a"),
+            assistant(10, &[]),
+            assistant(10 + 36_000, &[]),
+        ];
+        assert_eq!(build_runs(&evs, CAP, &[])[0].run.dur_sec, 10 + 900);
+    }
+
+    #[test]
+    fn typed_command_wins_then_first_skill_then_plain() {
+        let evs = vec![
+            typed(0, "spectra-apply"),
+            assistant(5, &["spectra-verify", "spectra-verify"]),
+            prompt(100, "p"),
+            assistant(105, &["spectra-review", "spectra-apply"]),
+            prompt(200, "q"),
+            assistant(205, &[]),
+        ];
+        let r = build_runs(&evs, CAP, &[]);
+        assert_eq!(r[0].run.trigger, "spectra-apply");
+        assert_eq!(
+            r[0].run.skills,
+            vec!["spectra-verify"],
+            "deduped, trigger excluded"
+        );
+        assert_eq!(r[1].run.trigger, "spectra-review");
+        assert_eq!(r[1].run.skills, vec!["spectra-apply"]);
+        assert_eq!(r[2].run.trigger, PLAIN_PROMPT);
+    }
+
+    #[test]
+    fn local_commands_and_unanswered_prompts_are_not_runs() {
+        let evs = vec![
+            typed(0, "compact"),
+            assistant(5, &[]),
+            typed(100, "goal"),
+            assistant(105, &[]),
+            typed(200, "Model"),
+            ev(Role::UserOther, 201),
+            prompt(300, "x"),
+            ev(Role::UserOther, 301), // never answered
+            typed(400, "my-own"),
+            assistant(405, &[]),
+        ];
+        let names: Vec<_> = build_runs(&evs, CAP, &["my-own".into()])
+            .iter()
+            .map(|b| b.run.trigger.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["goal"],
+            "/goal is agent work; --run-exclude drops my-own"
+        );
+    }
+
+    #[test]
+    fn interrupts_are_counted_and_the_last_one_marks_how_the_run_ended() {
+        let evs = vec![
+            prompt(0, "a"),
+            assistant(10, &[]),
+            interrupt(11),
+            assistant(20, &[]),
+            interrupt(21),
+            prompt(100, "b"),
+            assistant(110, &[]),
+            interrupt(111),
+            assistant(120, &[]),
+        ];
+        let r = build_runs(&evs, CAP, &[]);
+        assert_eq!(
+            (r[0].run.interrupts, r[0].run.ended_by_interrupt),
+            (2, true)
+        );
+        assert_eq!(
+            (r[1].run.interrupts, r[1].run.ended_by_interrupt),
+            (1, false),
+            "work resumed after it"
+        );
+    }
+
+    #[test]
+    fn subagent_and_metadata_lines_never_extend_a_run() {
+        let evs = vec![
+            prompt(0, "a"),
+            assistant(10, &[]),
+            Event {
+                sidechain: true,
+                ..assistant(5000, &[])
+            },
+            ev(Role::Other, 9000),
+        ];
+        assert_eq!(build_runs(&evs, CAP, &[])[0].run.dur_sec, 10);
+    }
+
+    #[test]
+    fn a_resumed_copy_of_a_run_is_counted_once_keeping_the_longer_one() {
+        let short = build_runs(&[prompt(0, "same"), assistant(10, &[])], CAP, &[]);
+        let long = build_runs(
+            &[prompt(0, "same"), assistant(10, &[]), assistant(50, &[])],
+            CAP,
+            &[],
+        );
+        let d = dedupe_runs(short.into_iter().chain(long).collect());
+        assert_eq!((d.len(), d[0].run.dur_sec), (1, 50));
+    }
+
+    #[test]
+    fn nearest_rank_percentiles_match_the_viewer() {
+        let v: Vec<u64> = (1..=10).collect();
+        assert_eq!(
+            (pct(&v, 0.5), pct(&v, 0.9), pct(&v, 0.99), pct(&[], 0.5)),
+            (6, 10, 10, 0)
+        );
+    }
+
+    // Mon 2026-11-09 08:00:00 UTC, so weeks and run dates agree with the epochs used below.
+    fn t0() -> i64 {
+        NaiveDate::from_ymd_opt(2026, 11, 9)
+            .unwrap()
+            .and_hms_opt(8, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp()
+    }
+    fn utc() -> FixedOffset {
+        FixedOffset::east_opt(0).unwrap()
+    }
+    fn main_run(session: &str, a: i64, b: i64) -> RunBuild {
+        let mut r = build_runs(
+            &[prompt(a, &format!("{session}{a}")), assistant(b, &[])],
+            CAP,
+            &[],
+        );
+        r[0].run.date = "2026-11-09".into();
+        r[0].session = session.into();
+        r.remove(0)
+    }
+    fn sub(session: &str, a: i64, b: i64) -> SubWork {
+        SubWork {
+            session: session.into(),
+            segs: vec![(a, b)],
+        }
+    }
+
+    #[test]
+    fn overlapping_runs_raise_parallelism_and_back_to_back_ones_do_not() {
+        let base = t0();
+        let runs = [
+            main_run("s1", base, base + 600),
+            main_run("s2", base + 300, base + 900),
+            main_run("s3", base + 1000, base + 1100),
+            main_run("s4", base + 1100, base + 1200),
+        ];
+        let t = weekly_totals(&runs, &[], &utc());
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].peak_parallel, 2);
+        // agent = 600+600+100+100 = 1400 s; union = [0,900] + [1000,1200] = 1100 s
+        assert!(
+            (t[0].hours * 3600.0 - 1400.0).abs() < 1e-6
+                && (t[0].union_hours * 3600.0 - 1100.0).abs() < 1e-6
+        );
+        assert_eq!(
+            t[0].peak_parallel_all, 2,
+            "without subagents the two views agree"
+        );
+        assert!((t[0].avg_parallel_all - t[0].avg_parallel).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_main_agent_waiting_on_one_subagent_counts_once_not_twice() {
+        let base = t0();
+        let t = weekly_totals(
+            &[main_run("s1", base, base + 600)],
+            &[sub("s1", base, base + 600)],
+            &utc(),
+        );
+        assert_eq!(
+            (
+                t[0].peak_parallel,
+                t[0].peak_parallel_all,
+                t[0].peak_subagents
+            ),
+            (1, 1, 1)
+        );
+        assert!(
+            (t[0].avg_parallel_all - 1.0).abs() < 1e-9,
+            "one thread of work, however it is delegated"
+        );
+        assert!((t[0].subagent_hours * 3600.0 - 600.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parallel_subagents_show_up_and_the_main_agents_waiting_time_is_dropped() {
+        let base = t0();
+        // main works 0..600; subagent A 60..540 and B 120..480 overlap each other
+        let t = weekly_totals(
+            &[main_run("s1", base, base + 600)],
+            &[
+                sub("s1", base + 60, base + 540),
+                sub("s1", base + 120, base + 480),
+            ],
+            &utc(),
+        );
+        let w = &t[0];
+        assert_eq!(
+            (w.peak_parallel, w.peak_parallel_all, w.peak_subagents),
+            (1, 2, 2)
+        );
+        // main only: 600 s. main time left after the subagents' span 60..540 is removed: 120 s; plus 480 + 360
+        assert!((w.hours * 3600.0 - 600.0).abs() < 1e-6);
+        assert!(
+            (w.hours_all * 3600.0 - 960.0).abs() < 1e-6,
+            "{}",
+            w.hours_all * 3600.0
+        );
+        assert!((w.union_hours_all * 3600.0 - 600.0).abs() < 1e-6);
+        assert!((w.avg_parallel_all - 1.6).abs() < 1e-9);
+        assert!((w.subagent_hours * 3600.0 - 840.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn subagents_of_another_session_do_not_cancel_this_sessions_main_time() {
+        let base = t0();
+        let t = weekly_totals(
+            &[main_run("s1", base, base + 600)],
+            &[sub("other", base, base + 600)],
+            &utc(),
+        );
+        assert_eq!(
+            t[0].peak_parallel_all, 2,
+            "two unrelated sessions working at once"
+        );
+    }
+
+    #[test]
+    fn work_counts_in_the_week_it_starts_in() {
+        let sunday_late = t0() - 8 * 3600 + 6 * 86400 + 23 * 3600 + 50 * 60; // Sun 2026-11-15 23:50 UTC
+        let t = weekly_totals(&[], &[sub("s1", sunday_late, sunday_late + 1200)], &utc());
+        assert_eq!((t.len(), t[0].week.as_str()), (1, "2026-11-09"));
+        // the same instant is already Monday in +08:00
+        let t8 = weekly_totals(
+            &[],
+            &[sub("s1", sunday_late, sunday_late + 1200)],
+            &FixedOffset::east_opt(8 * 3600).unwrap(),
+        );
+        assert_eq!(t8[0].week, "2026-11-16");
+    }
+
+    #[test]
+    fn interval_helpers_merge_and_subtract() {
+        assert_eq!(
+            merge_intervals(vec![(5, 9), (0, 3), (2, 4), (9, 10)]),
+            vec![(0, 4), (5, 10)]
+        );
+        assert_eq!(
+            subtract_intervals((0, 10), &[(2, 4), (6, 7)]),
+            vec![(0, 2), (4, 6), (7, 10)]
+        );
+        assert_eq!(subtract_intervals((0, 10), &[(0, 10)]), vec![]);
+        assert_eq!(subtract_intervals((0, 10), &[(20, 30)]), vec![(0, 10)]);
+        assert_eq!(subtract_intervals((5, 10), &[(0, 7)]), vec![(7, 10)]);
+    }
+
+    #[test]
+    fn a_subagent_file_names_its_parent_session() {
+        let p = Path::new("/home/u/.claude/projects/-proj/abc-123/subagents/agent-x.jsonl");
+        assert_eq!(subagent_session(p).as_deref(), Some("abc-123"));
+        assert_eq!(
+            subagent_session(Path::new("/home/u/.claude/projects/-proj/abc-123.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn subagent_segments_use_every_line_and_cap_the_gaps() {
+        let evs = vec![
+            Event {
+                sidechain: true,
+                ..ev(Role::UserOther, 0)
+            },
+            Event {
+                sidechain: true,
+                ..assistant(100, &[])
+            },
+            Event {
+                sidechain: true,
+                ..ev(Role::Other, 150)
+            },
+            Event {
+                sidechain: true,
+                ..assistant(100 + 9000, &[])
+            },
+        ];
+        assert_eq!(agent_segments(&evs, CAP), vec![(0, 100), (100, 1000)]);
+    }
+
+    #[test]
+    fn json_embedded_in_a_script_element_cannot_end_it() {
+        let v = json!({"name": "</script><!--&\u{2028}\u{2029}>", "n": 1});
+        let out = json_for_script(&v).unwrap();
+        assert!(
+            !out.contains(['<', '>', '&', '\u{2028}', '\u{2029}']),
+            "{out}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            v,
+            "escapes are plain JSON, nothing is lost"
+        );
+    }
+
+    #[test]
+    fn weeks_start_on_monday() {
+        assert_eq!(
+            (
+                week_start("2026-11-09").as_str(),
+                week_start("2026-11-15").as_str()
+            ),
+            ("2026-11-09", "2026-11-09")
+        );
+        assert_eq!(week_start("2026-11-16"), "2026-11-16");
+    }
+
+    #[test]
+    fn user_lines_are_classified_like_the_transcript_marks_them() {
+        let c = |v: Value| classify_user(&v);
+        assert_eq!(
+            c(json!({"message":{"content":"fix the bug"}})).0,
+            Role::HumanPrompt
+        );
+        assert_eq!(c(json!({"message":{"content":[{"type":"text","text":"hi"}]},"origin":{"kind":"human"}})).0, Role::HumanPrompt);
+        assert_eq!(
+            c(json!({"message":{"content":[{"type":"tool_result","content":"x"}]}})).0,
+            Role::UserOther
+        );
+        assert_eq!(
+            c(json!({"message":{"content":"<task-notification>x"}})).0,
+            Role::UserOther
+        );
+        assert_eq!(
+            c(json!({"message":{"content":"<local-command-stdout>x"}})).0,
+            Role::UserOther
+        );
+        assert_eq!(
+            c(json!({"message":{"content":"hi"},"isMeta":true})).0,
+            Role::UserOther
+        );
+        assert_eq!(
+            c(
+                json!({"message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}})
+            ),
+            (Role::UserOther, true)
+        );
+        assert_eq!(
+            c(json!({"message":{"content":"[Request interrupted by user for tool use]"}})),
+            (Role::UserOther, true)
+        );
+    }
+
+    #[test]
+    fn command_names_are_read_from_the_slash_command_markup() {
+        assert_eq!(
+            command_name(
+                "<command-message>x</command-message>\n<command-name>/spectra-apply</command-name>"
+            )
+            .as_deref(),
+            Some("spectra-apply")
+        );
+        assert_eq!(
+            command_name("<command-name>reviewer:result</command-name>").as_deref(),
+            Some("reviewer:result")
+        );
+        assert_eq!(command_name("no markup"), None);
+    }
+
+    #[test]
+    fn triggers_are_discovered_ranked_and_flagged_without_configuration() {
+        let mk = |trigger: &str, dur: u64, date: &str| Run {
+            date: date.into(),
+            start: 0,
+            dur_sec: dur,
+            trigger: trigger.into(),
+            skills: vec![],
+            interrupts: 1,
+            ended_by_interrupt: false,
+            project: "p".into(),
+            uuid: None,
+            events: 2,
+        };
+        let mut runs: Vec<Run> = (0..5)
+            .map(|i| mk("big", 1200, &format!("2026-10-0{}", i + 1)))
+            .collect();
+        runs.push(mk("brand-new-skill", 30, "2026-11-10"));
+        runs.push(mk("quick", 30, "2026-11-10"));
+        let s = summarize_triggers(&runs);
+        assert_eq!(s[0].name, "big", "ranked by hours");
+        assert!(s[0].runner && !s[0].is_new);
+        let n = s.iter().find(|t| t.name == "brand-new-skill").unwrap();
+        assert!(n.is_new && !n.runner, "seen only in the last 14 days");
+        assert_eq!(s[0].interrupts_per_hour, 5.0 / (6000.0 / 3600.0));
     }
 }

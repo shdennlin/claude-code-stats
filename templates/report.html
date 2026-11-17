@@ -58,6 +58,28 @@
   .col-toggle{display:inline-flex;align-items:center;gap:4px;background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:3px 8px;font-size:12px;cursor:pointer;user-select:none}
   .col-toggle input{margin:0;width:auto}
   [data-hint]:hover{z-index:1001}
+  .view{display:grid;gap:16px}
+  .view[hidden]{display:none}
+  .tabs{display:flex;gap:6px;padding:8px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:50;background:var(--bg)}
+  .tabs button{width:auto;padding:6px 18px;font-weight:600}
+  .tabs button.active{border-color:var(--accent);color:var(--accent);background:var(--panel)}
+  .runs-controls{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));align-items:end}
+  .runs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}
+  .runs-cell{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .runs-cell h3{margin:0 0 2px;font-size:13px;font-weight:600}
+  .runs-cell .stats{color:var(--muted);font-size:11px;margin-bottom:6px}
+  .runs-cell .chart-wrap{height:210px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:10px}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px}
+  .legend i.hollow{background:transparent;border:2px solid var(--warn)}
+  .legend i.line{border-radius:0;height:3px;width:16px;vertical-align:3px}
+  #t-runs th[data-sort]{cursor:pointer;user-select:none}
+  #t-runs tr.pinned{background:var(--panel2);outline:1px solid var(--accent)}
+  #t-runs tbody tr{cursor:pointer}
+  .badge{display:inline-block;padding:1px 6px;border-radius:9px;font-size:10px;margin-left:4px;border:1px solid var(--line)}
+  .badge.runner{color:var(--good);border-color:var(--good)}
+  .badge.new{color:var(--warn);border-color:var(--warn)}
+  .spark{vertical-align:middle}
   #t-projects{table-layout:fixed;width:100%}
   #t-projects th{position:relative;padding-right:14px}
   #t-projects th .th-label{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
@@ -89,6 +111,11 @@
   <h1>Claude Code Stats</h1>
   <div class="meta" id="meta"></div>
 </header>
+
+<nav class="tabs" id="view-tabs">
+  <button data-view="overview" class="active">Overview</button>
+  <button data-view="runs" id="tab-runs">Runs</button>
+</nav>
 
 <main>
 
@@ -146,6 +173,7 @@
     </div>
   </section>
 
+<div id="view-overview" class="view">
   <section class="row" id="summary-cards"></section>
 
   <section class="panel">
@@ -283,6 +311,68 @@
     </table>
   </section>
 
+</div><!-- /view-overview -->
+
+<div id="view-runs" class="view" hidden>
+  <section class="panel">
+    <h2>Runs <span class="muted" style="font-size:12px;font-weight:normal">— one run = a prompt of yours until the next one. Commands and skills are discovered from your transcripts, nothing is configured.</span></h2>
+    <div class="runs-controls">
+      <div class="field"><label>Group by</label>
+        <select id="runs-group">
+          <option value="trigger">What started the run (typed command, else first skill)</option>
+          <option value="skill">Any skill used inside the run (runs overlap)</option>
+        </select></div>
+      <div class="field"><label>Min runs for a row / chart</label><input type="number" id="runs-min" min="1" max="500"></div>
+      <div class="field"><label>Charts show top</label>
+        <select id="runs-top"><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option></select></div>
+      <div class="field"><label>Min runs for a weekly point</label><input type="number" id="runs-minweek" min="1" max="50"></div>
+      <div class="field"><label class="col-toggle"><input type="checkbox" id="runs-plain"> Chart plain prompts too</label></div>
+    </div>
+    <div class="muted" id="runs-note" style="font-size:12px;margin-top:8px"></div>
+  </section>
+
+  <section class="row" id="runs-cards"></section>
+
+  <section class="panel">
+    <h2>How long you let it run <span class="muted" style="font-size:12px;font-weight:normal">— each dot is one run, log scale; click a row in the table to pin it first</span></h2>
+    <div class="legend">
+      <span><i style="background:#7c9eff"></i>run ended on its own</span>
+      <span><i class="hollow"></i>you interrupted it</span>
+      <span><i class="line" style="background:#5dd39e"></i>weekly median</span>
+      <span><i class="line" style="background:#a978ff"></i>weekly P90</span>
+    </div>
+    <div id="runs-trend" class="runs-grid"></div>
+  </section>
+
+  <section class="grid-2">
+    <div class="panel">
+      <h2>Agent hours by week <span class="muted" style="font-size:12px;font-weight:normal">— stacked by what started the run</span></h2>
+      <div class="chart-wrap tall"><canvas id="ch-runs-hours"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>Parallelism by week <span class="muted" style="font-size:12px;font-weight:normal" id="runs-par-note"></span></h2>
+      <label class="col-toggle" style="margin-bottom:8px" title="Count subagents as agents working. A main agent waiting on its own subagents is not counted on top of them."><input type="checkbox" id="runs-subagents"> Count subagents</label>
+      <div class="chart-wrap tall"><canvas id="ch-runs-par"></canvas></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Triggers <span class="muted" style="font-size:12px;font-weight:normal">— click a header to sort, a row to pin it in the charts</span></h2>
+    <div style="overflow:auto"><table id="t-runs"><thead><tr id="t-runs-head"></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="panel">
+    <h2>How to read this</h2>
+    <ul class="muted" style="margin:0;padding-left:18px;font-size:12px;line-height:1.7">
+      <li><b>Duration</b> is active time: every gap between two events of a run is capped at the <code>--gap</code> threshold, so sleep, permission waits and left-open sessions do not inflate it.</li>
+      <li><b>Median / P90 / P99</b>: half / nine in ten / ninety-nine in a hundred runs are shorter. Watch P90 and the weekly lines, not the median: long runs live in the tail.</li>
+      <li><b>Interrupts</b> are the "[Request interrupted by user]" markers inside a run. Stepping in when you see a problem is a choice about where your attention goes, not a score to minimise; compare it with how long runs last between interruptions.</li>
+      <li><b>runner</b> = at least 5 runs and at least 30% of them over 10 minutes. <b>new</b> = first seen in the last 14 days of the data.</li>
+      <li>A run ends at your next prompt, so one long piece of work you steered with "continue" shows up as several runs. Subagent work is part of its parent's run.</li>
+    </ul>
+  </section>
+</div><!-- /view-runs -->
+
 </main>
 
 <script>
@@ -328,6 +418,9 @@ function saveState() {
       sesFilter: state.sesFilter,
       sesLimit: state.sesLimit,
       hourMetric: state.hourMetric,
+      view: state.view, runsGroup: state.runsGroup, runsMin: state.runsMin, runsTop: state.runsTop,
+      runsMinWeek: state.runsMinWeek, runsPlain: state.runsPlain, runsSort: state.runsSort, runsPinned: state.runsPinned,
+      runsSubagents: state.runsSubagents,
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(blob));
   } catch (e) { /* quota / private mode — silently ignore */ }
@@ -355,6 +448,13 @@ function loadState() {
     if (typeof s.sesFilter === 'string') state.sesFilter = s.sesFilter;
     if (typeof s.sesLimit === 'number') state.sesLimit = s.sesLimit;
     if (HOUR_METRICS[s.hourMetric]) state.hourMetric = s.hourMetric;
+    if (s.view === 'overview' || s.view === 'runs') state.view = s.view;
+    if (s.runsGroup === 'trigger' || s.runsGroup === 'skill') state.runsGroup = s.runsGroup;
+    for (const k of ['runsMin', 'runsTop', 'runsMinWeek']) if (Number.isFinite(s[k]) && s[k] > 0) state[k] = s[k];
+    if (typeof s.runsPlain === 'boolean') state.runsPlain = s.runsPlain;
+    if (typeof s.runsSubagents === 'boolean') state.runsSubagents = s.runsSubagents;
+    if (s.runsSort && s.runsSort.key) state.runsSort = s.runsSort;
+    if (typeof s.runsPinned === 'string' || s.runsPinned === null) state.runsPinned = s.runsPinned;
     return true;
   } catch (e) { return false; }
 }
@@ -520,6 +620,15 @@ const state = {
   sesFilter: '',
   sesLimit: 100,
   hourMetric: 'active',  // 'active' | 'output' | 'cost' — what the by-hour chart plots
+  view: 'overview',      // 'overview' | 'runs'
+  runsGroup: 'trigger',  // 'trigger' | 'skill'
+  runsMin: 5,            // fewest runs for a table row / chart
+  runsTop: 4,            // charts shown
+  runsMinWeek: 3,        // fewest runs for a weekly point
+  runsPlain: false,      // chart plain prompts too
+  runsSort: {key: 'hours', dir: -1},
+  runsPinned: null,      // trigger pinned first in the charts
+  runsSubagents: true,   // parallelism chart counts subagents
 };
 
 function startResize(ev, th, key) {
@@ -662,6 +771,7 @@ function init() {
   document.getElementById('merge-pattern').addEventListener('keydown', e => { if (e.key === 'Enter') addMergeRule(); });
   document.getElementById('omit-pattern').addEventListener('keydown', e => { if (e.key === 'Enter') addOmitRule(); });
   renderOmitList();
+  initRuns();
 
   renderColumnToggles();
   renderQuickButtons();
@@ -1102,6 +1212,7 @@ function render() {
   renderStop(f);
   renderBranch(f);
   renderSessionLog(f);
+  if (state.view === 'runs') renderRuns();
   saveState();
 }
 
@@ -1762,6 +1873,370 @@ function renderSkill(f) {
     s => s.name,
     s => [fmtInt(s.messages), 'num'],
   ]);
+}
+
+// ---------- Runs ----------
+// One run = a human prompt until the next one (built by cc-stats from the transcripts). Everything
+// below recomputes from DATA.runs so it follows the date window, project selection, merge and omit rules.
+const RUN_PLAIN = '(plain prompt)';
+const RUN_COLORS = ['#7c9eff', '#a978ff', '#5dd39e', '#f5a35d', '#f06c6c', '#4fc3d9', '#d9c24f', '#c77dba'];
+const RUN_OTHER = '#5a6275', C_WARN = '#f5a35d';
+
+// Nearest-rank percentile on an ascending array: the same rule cc-stats uses for data.json.
+function runPct(sorted, p) {
+  return sorted.length ? sorted[Math.min(Math.floor(sorted.length * p), sorted.length - 1)] : 0;
+}
+function fmtRunDur(sec) {
+  sec = Math.max(0, sec);
+  if (sec < 60) return Math.round(sec) + 's';
+  if (sec < 3600) return fmtNum(sec / 60, 1) + 'm';
+  return fmtNum(sec / 3600, 1) + 'h';
+}
+function tzOffsetSec() {
+  const m = /^([+-])(\d{2}):?(\d{2})$/.exec((DATA.summary && DATA.summary.tz_offset) || '');
+  return m ? (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 3600 + Number(m[3]) * 60) : 0;
+}
+function weekStart(date) {  // Monday of the week containing `date` (YYYY-MM-DD)
+  const d = new Date(date + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
+}
+function weeksBetween(from, to) {
+  const out = [];
+  for (let w = weekStart(from); w <= to; ) {
+    out.push(w);
+    const d = new Date(w + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + 7); w = d.toISOString().slice(0, 10);
+  }
+  return out;
+}
+
+let _runFirstSeen = null, _runLatest = '';
+function runFirstSeen() {  // name -> first date it was ever seen, over ALL runs (not just the window)
+  if (_runFirstSeen) return _runFirstSeen;
+  _runFirstSeen = new Map(); _runLatest = '';
+  for (const r of (DATA.runs || [])) {
+    if (r.date > _runLatest) _runLatest = r.date;
+    for (const n of [r.trigger, ...(r.skills || [])]) {
+      const cur = _runFirstSeen.get(n);
+      if (cur === undefined || r.date < cur) _runFirstSeen.set(n, r.date);
+    }
+  }
+  return _runFirstSeen;
+}
+
+function runsFiltered() {
+  const ok = new Map();
+  const keep = (proj) => {
+    let v = ok.get(proj);
+    if (v === undefined) {
+      v = !isOmitted(proj);
+      if (v) { const m = applyMerge(proj); v = !isOmitted(m) && state.projects.has(m); }
+      ok.set(proj, v);
+    }
+    return v;
+  };
+  return (DATA.runs || []).filter(r => r.date >= state.from && r.date <= state.to && keep(r.project));
+}
+
+// name -> runs. 'trigger': by what started the run. 'skill': by every skill used in it (a run can count in several).
+function runGroups(runs, mode) {
+  const g = new Map();
+  for (const r of runs) {
+    const names = mode === 'skill' ? Array.from(new Set([r.trigger, ...(r.skills || [])])).filter(n => n !== RUN_PLAIN) : [r.trigger];
+    for (const n of names) { if (!g.has(n)) g.set(n, []); g.get(n).push(r); }
+  }
+  return g;
+}
+
+function summarizeRuns(name, rs) {
+  const d = rs.map(r => r.dur_sec).sort((a, b) => a - b);
+  const hours = d.reduce((a, b) => a + b, 0) / 3600;
+  const interrupts = rs.reduce((a, r) => a + (r.interrupts || 0), 0);
+  let last = rs[0].date;
+  for (const r of rs) if (r.date > last) last = r.date;
+  const over10 = d.filter(x => x > 600).length * 100 / d.length;
+  const first = runFirstSeen().get(name) || rs[0].date;
+  return {
+    name, runs: d.length, median: runPct(d, .5), p90: runPct(d, .9), p99: runPct(d, .99), max: d[d.length - 1],
+    hours, over10, interrupts, intPerHour: hours > 0 ? interrupts / hours : 0,
+    endedByInterrupt: rs.filter(r => r.ended_by_interrupt).length * 100 / d.length,
+    last, first, isNew: (Date.parse(_runLatest) - Date.parse(first)) / 86400000 <= 14,
+    runner: d.length >= 5 && over10 >= 30,
+  };
+}
+
+// Weekly median / P90 / hours for one group, over the weeks of the window. `ok` = enough runs to trust the point.
+function runWeekly(rs, weeks, minWeek) {
+  const by = new Map(weeks.map(w => [w, []]));
+  for (const r of rs) { const b = by.get(weekStart(r.date)); if (b) b.push(r.dur_sec); }
+  return weeks.map(w => {
+    const d = by.get(w).sort((a, b) => a - b);
+    return {week: w, n: d.length, median: runPct(d, .5), p90: runPct(d, .9), hours: d.reduce((a, b) => a + b, 0) / 3600, ok: d.length >= minWeek};
+  });
+}
+
+function initRuns() {
+  const has = !!(DATA.runs && DATA.runs.length);
+  document.getElementById('tab-runs').hidden = !has;
+  if (!has) state.view = 'overview';
+  const g = id => document.getElementById(id);
+  g('runs-group').value = state.runsGroup;
+  g('runs-min').value = state.runsMin;
+  g('runs-top').value = String(state.runsTop);
+  g('runs-minweek').value = state.runsMinWeek;
+  g('runs-plain').checked = state.runsPlain;
+  g('runs-subagents').checked = state.runsSubagents;
+  g('runs-subagents').disabled = !hasSubagentParallelism();
+  const apply = () => { saveState(); renderRuns(); };
+  g('runs-group').addEventListener('change', e => { state.runsGroup = e.target.value; state.runsPinned = null; apply(); });
+  g('runs-min').addEventListener('change', e => { state.runsMin = Math.max(1, Number(e.target.value) || 1); apply(); });
+  g('runs-top').addEventListener('change', e => { state.runsTop = Number(e.target.value) || 4; apply(); });
+  g('runs-minweek').addEventListener('change', e => { state.runsMinWeek = Math.max(1, Number(e.target.value) || 1); apply(); });
+  g('runs-plain').addEventListener('change', e => { state.runsPlain = e.target.checked; apply(); });
+  g('runs-subagents').addEventListener('change', e => { state.runsSubagents = e.target.checked; apply(); });
+  for (const b of document.querySelectorAll('#view-tabs button')) b.addEventListener('click', () => setView(b.dataset.view));
+  setView(state.view, true);
+}
+function setView(v, initial) {
+  state.view = v;
+  document.getElementById('view-overview').hidden = v !== 'overview';
+  document.getElementById('view-runs').hidden = v !== 'runs';
+  for (const b of document.querySelectorAll('#view-tabs button')) b.classList.toggle('active', b.dataset.view === v);
+  if (initial) return;  // init() renders everything once the filters are ready
+  if (v === 'runs') renderRuns(); else render();
+  saveState();
+}
+
+let _runTrendIds = [];
+function renderRuns() {
+  if (!DATA.runs || !DATA.runs.length) return;
+  runFirstSeen();
+  const runs = runsFiltered();
+  const groups = runGroups(runs, state.runsGroup);
+  const rows = Array.from(groups, ([name, rs]) => summarizeRuns(name, rs));
+  const weeks = weeksBetween(state.from, state.to);
+  document.getElementById('runs-note').textContent =
+    fmtInt(runs.length) + ' runs in the window · ' + rows.filter(r => r.runs >= state.runsMin).length + ' of ' + rows.length +
+    ' ' + (state.runsGroup === 'skill' ? 'skills' : 'triggers') + ' have at least ' + state.runsMin + ' runs.';
+  renderRunsCards(runs);
+  renderRunsTrend(groups, rows, weeks);
+  renderRunsHours(runs, weeks);
+  renderRunsParallel(weeks);
+  renderRunsTable(rows.filter(r => r.runs >= state.runsMin), groups, weeks);
+}
+
+function runCard(label, val, sub) {
+  return el('div', {class: 'card'}, el('div', {class: 'label'}, label), el('div', {class: 'val'}, val), el('div', {class: 'sub'}, sub || ''));
+}
+function renderRunsCards(runs) {
+  const box = document.getElementById('runs-cards'); clear(box);
+  if (!runs.length) { box.appendChild(runCard('Runs', '0', 'nothing in this window / selection')); return; }
+  const d = runs.map(r => r.dur_sec).sort((a, b) => a - b);
+  const total = d.reduce((a, b) => a + b, 0);
+  const long = d.filter(x => x > 600);
+  const longSec = long.reduce((a, b) => a + b, 0);
+  const interrupts = runs.reduce((a, r) => a + (r.interrupts || 0), 0);
+  box.append(
+    runCard('Runs', fmtInt(runs.length), 'agent answered a prompt of yours'),
+    runCard('Agent hours', fmtNum(total / 3600, 1), 'active time, gaps capped'),
+    runCard('Median run', fmtRunDur(runPct(d, .5)), 'P90 ' + fmtRunDur(runPct(d, .9)) + ' · P99 ' + fmtRunDur(runPct(d, .99))),
+    runCard('Runs over 10 min', fmtInt(long.length), fmtNum(total ? longSec * 100 / total : 0, 0) + '% of agent hours'),
+    runCard('Interrupts / agent hour', fmtNum(total ? interrupts / (total / 3600) : 0, 2), fmtInt(interrupts) + ' markers · where you stepped in'),
+  );
+}
+
+function dotDate(ms) { const d = new Date(ms); return String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0'); }
+function minTick(v) { return [0.1, 1, 10, 100, 1000].includes(v) ? (v < 1 ? Math.round(v * 60) + 's' : v < 60 ? v + 'm' : (v / 60) + 'h') : ''; }
+
+// Dots for every run (so a week with three runs looks like three runs) with the weekly median / P90 laid over them.
+function trendConfig(rs, weeks) {
+  const off = tzOffsetSec();
+  const dot = r => ({x: (r.start + off) * 1000, y: Math.max(r.dur_sec / 60, 0.05), run: r});
+  const weekly = runWeekly(rs, weeks, state.runsMinWeek).filter(w => w.ok);
+  const mid = w => Date.parse(w.week + 'T00:00:00Z') + 3.5 * 86400000;
+  const line = (label, key, color, dash) => ({type: 'line', label, data: weekly.map(w => ({x: mid(w), y: Math.max(w[key] / 60, 0.05)})),
+    borderColor: color, backgroundColor: color, borderWidth: 2, borderDash: dash || [], pointRadius: 3, tension: 0.25, order: 0});
+  return {
+    type: 'scatter',
+    data: {datasets: [
+      {label: 'ended on its own', data: rs.filter(r => !r.ended_by_interrupt).map(dot), backgroundColor: 'rgba(124,158,255,.45)', pointRadius: 2.5, order: 2},
+      {label: 'you interrupted', data: rs.filter(r => r.ended_by_interrupt).map(dot), backgroundColor: 'transparent', borderColor: C_WARN, borderWidth: 1.5, pointRadius: 3.5, order: 1},
+      line('weekly median', 'median', '#5dd39e'),
+      line('weekly P90', 'p90', '#a978ff', [5, 4]),
+    ]},
+    options: {
+      maintainAspectRatio: false, animation: false,
+      scales: {
+        x: {type: 'linear', min: Date.parse(state.from + 'T00:00:00Z'), max: Date.parse(state.to + 'T00:00:00Z') + 86400000,
+            ticks: {color: C_TEXT, maxTicksLimit: 6, callback: v => dotDate(v)}, grid: {color: C_GRID}},
+        y: {type: 'logarithmic', min: 0.05, ticks: {color: C_TEXT, callback: minTick}, grid: {color: C_GRID}},
+      },
+      plugins: {
+        legend: {display: false},
+        tooltip: {callbacks: {label: ctx => ctx.raw.run
+          ? ctx.raw.run.date + ' · ' + fmtRunDur(ctx.raw.run.dur_sec) + ' · ' + (ctx.raw.run.interrupts || 0) + ' interrupt(s)'
+          : ctx.dataset.label + ' ' + fmtRunDur(ctx.raw.y * 60)}},
+      },
+    },
+  };
+}
+
+function renderRunsTrend(groups, rows, weeks) {
+  const host = document.getElementById('runs-trend'); clear(host);
+  for (const id of _runTrendIds) if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+  _runTrendIds = [];
+  let cands = rows.filter(r => r.runs >= state.runsMin && (state.runsPlain || r.name !== RUN_PLAIN));
+  cands.sort((a, b) => b.hours - a.hours);
+  const pinned = cands.find(r => r.name === state.runsPinned);
+  if (pinned) cands = [pinned, ...cands.filter(r => r !== pinned)];
+  cands = cands.slice(0, state.runsTop);
+  if (!cands.length) { host.appendChild(el('div', {class: 'muted'}, 'No trigger has at least ' + state.runsMin + ' runs in this window.')); return; }
+  cands.forEach((r, i) => {
+    const id = 'ch-runs-trend-' + i; _runTrendIds.push(id);
+    const title = el('h3', null, r.name);
+    if (r.runner) title.appendChild(el('span', {class: 'badge runner'}, 'runner'));
+    if (r.isNew) title.appendChild(el('span', {class: 'badge new'}, 'new'));
+    const stats = el('div', {class: 'stats'}, r.runs + ' runs · median ' + fmtRunDur(r.median) + ' · P90 ' + fmtRunDur(r.p90) +
+      ' · ' + fmtNum(r.hours, 1) + ' h · ' + fmtNum(r.endedByInterrupt, 0) + '% ended by your interrupt');
+    const cell = el('div', {class: 'runs-cell'}, title, stats, el('div', {class: 'chart-wrap'}, el('canvas', {id})));
+    host.appendChild(cell);
+    makeChart(id, trendConfig(groups.get(r.name), weeks));
+  });
+}
+
+// Stacked weekly agent hours by what started the run (always by trigger: the stack must not double count).
+function renderRunsHours(runs, weeks) {
+  const g = runGroups(runs, 'trigger');
+  const rows = Array.from(g, ([name, rs]) => ({name, hours: rs.reduce((a, r) => a + r.dur_sec, 0) / 3600})).sort((a, b) => b.hours - a.hours);
+  const top = rows.slice(0, 6).map(r => r.name), topSet = new Set(top);
+  const series = new Map([...top, 'other'].map(n => [n, new Array(weeks.length).fill(0)]));
+  const idx = new Map(weeks.map((w, i) => [w, i]));
+  for (const r of runs) {
+    const i = idx.get(weekStart(r.date));
+    if (i !== undefined) series.get(topSet.has(r.trigger) ? r.trigger : 'other')[i] += r.dur_sec / 3600;
+  }
+  const names = [...top, 'other'].filter(n => series.get(n).some(v => v > 0));
+  makeChart('ch-runs-hours', {
+    type: 'line',
+    data: {labels: weeks, datasets: names.map((n, i) => {
+      const c = n === 'other' ? RUN_OTHER : RUN_COLORS[i % RUN_COLORS.length];
+      return {label: n, data: series.get(n), fill: true, backgroundColor: c + 'aa', borderColor: c, borderWidth: 1, pointRadius: 0, tension: 0.25};
+    })},
+    options: {maintainAspectRatio: false, animation: false, interaction: {mode: 'index', intersect: false},
+      scales: {x: {ticks: {color: C_TEXT, maxTicksLimit: 8}, grid: {color: C_GRID}},
+               y: {stacked: true, beginAtZero: true, title: {display: true, text: 'agent hours / week', color: C_TEXT}, ticks: {color: C_TEXT}, grid: {color: C_GRID}}},
+      plugins: {legend: {labels: {color: C_TEXT}}}},
+  });
+}
+
+// How many agents ran at once. Computed by cc-stats from run intervals, so it ignores the project selection.
+// With subagents counted, a main agent that is waiting on its own subagents is not counted on top of them:
+// one subagent running alone is 1 thread of work, two at once are 2.
+function hasSubagentParallelism() {
+  const w = (DATA.runs_weekly_total || [])[0];
+  return !!w && w.avg_parallel_all !== undefined;
+}
+function renderRunsParallel(weeks) {
+  const by = new Map((DATA.runs_weekly_total || []).map(w => [w.week, w]));
+  const at = w => by.get(w) || {};
+  const withSub = state.runsSubagents && hasSubagentParallelism();
+  document.getElementById('runs-par-note').textContent = withSub
+    ? '— all projects, subagents counted; a main agent waiting on its subagents is not counted twice'
+    : '— all projects, main sessions only';
+  const pick = (w, sub, main) => { const v = at(w)[withSub ? sub : main]; return v === undefined ? null : v; };
+  const datasets = [
+    {label: withSub ? 'average, subagents counted' : 'average while any agent ran', data: weeks.map(w => pick(w, 'avg_parallel_all', 'avg_parallel')),
+     borderColor: C_ACCENT, backgroundColor: C_ACCENT, pointRadius: 3, tension: 0.25, spanGaps: false},
+    {label: withSub ? 'peak at once, subagents counted' : 'peak at once', data: weeks.map(w => pick(w, 'peak_parallel_all', 'peak_parallel')),
+     borderColor: C_ACCENT2, backgroundColor: C_ACCENT2, borderDash: [5, 4], pointRadius: 3, stepped: true, spanGaps: false},
+  ];
+  if (withSub) datasets.push({label: 'for comparison: average, main sessions only', data: weeks.map(w => pick(w, 'avg_parallel', 'avg_parallel')),
+     borderColor: C_TEXT, backgroundColor: C_TEXT, borderWidth: 1, pointRadius: 0, tension: 0.25, spanGaps: false});
+  makeChart('ch-runs-par', {
+    type: 'line',
+    data: {labels: weeks, datasets},
+    options: {maintainAspectRatio: false, animation: false,
+      scales: {x: {ticks: {color: C_TEXT, maxTicksLimit: 8}, grid: {color: C_GRID}},
+               y: {beginAtZero: true, title: {display: true, text: 'agents working', color: C_TEXT}, ticks: {color: C_TEXT, precision: 0}, grid: {color: C_GRID}}},
+      plugins: {legend: {labels: {color: C_TEXT}}}},
+  });
+}
+
+const RUN_COLS = [
+  {key: 'name',       label: 'Trigger',       num: false},
+  {key: 'runs',       label: 'Runs',          num: true,  fmt: fmtInt},
+  {key: 'median',     label: 'Median',        num: true,  fmt: fmtRunDur},
+  {key: 'p90',        label: 'P90',           num: true,  fmt: fmtRunDur},
+  {key: 'p99',        label: 'P99',           num: true,  fmt: fmtRunDur},
+  {key: 'max',        label: 'Max',           num: true,  fmt: fmtRunDur},
+  {key: 'hours',      label: 'Hours',         num: true,  fmt: v => fmtNum(v, 1)},
+  {key: 'over10',     label: '>10m',          num: true,  fmt: v => fmtNum(v, 0) + '%'},
+  {key: 'intPerHour', label: 'Interrupts/h',  num: true,  fmt: v => fmtNum(v, 2)},
+  {key: 'trend',      label: 'Weekly median', num: false, nosort: true},
+  {key: 'last',       label: 'Last seen',     num: false},
+];
+
+function sparkline(series) {
+  const W = 96, H = 22, ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', W); svg.setAttribute('height', H); svg.setAttribute('class', 'spark');
+  const max = Math.max(...series.filter(p => p.ok).map(p => p.median), 1);
+  const X = i => series.length > 1 ? 2 + i * (W - 4) / (series.length - 1) : W / 2;
+  const Y = v => H - 3 - (v / max) * (H - 6);
+  let seg = [];
+  const flush = () => {
+    if (seg.length > 1) {
+      const pl = document.createElementNS(ns, 'polyline');
+      pl.setAttribute('points', seg.map(p => p.join(',')).join(' '));
+      pl.setAttribute('fill', 'none'); pl.setAttribute('stroke', '#5dd39e'); pl.setAttribute('stroke-width', '1.5');
+      svg.appendChild(pl);
+    } else if (seg.length === 1) {
+      const c = document.createElementNS(ns, 'circle');
+      c.setAttribute('cx', seg[0][0]); c.setAttribute('cy', seg[0][1]); c.setAttribute('r', '1.8'); c.setAttribute('fill', '#5dd39e');
+      svg.appendChild(c);
+    }
+    seg = [];
+  };
+  series.forEach((p, i) => { if (p.ok) seg.push([X(i).toFixed(1), Y(p.median).toFixed(1)]); else flush(); });
+  flush();
+  const t = document.createElementNS(ns, 'title');
+  t.textContent = series.filter(p => p.ok).map(p => p.week + ': ' + fmtRunDur(p.median) + ' (' + p.n + ' runs)').join('\n') || 'not enough runs per week';
+  svg.appendChild(t);
+  return svg;
+}
+
+function renderRunsTable(rows, groups, weeks) {
+  const head = document.getElementById('t-runs-head'); clear(head);
+  for (const c of RUN_COLS) {
+    const th = el('th', {class: c.num ? 'num' : ''}, c.label + (state.runsSort.key === c.key ? (state.runsSort.dir < 0 ? ' ▼' : ' ▲') : ''));
+    if (!c.nosort) {
+      th.dataset.sort = c.key;
+      th.addEventListener('click', () => {
+        state.runsSort = {key: c.key, dir: state.runsSort.key === c.key ? -state.runsSort.dir : (c.key === 'name' ? 1 : -1)};
+        saveState(); renderRuns();
+      });
+    }
+    head.appendChild(th);
+  }
+  const {key, dir} = state.runsSort;
+  rows = rows.slice().sort((a, b) => (typeof a[key] === 'string' ? a[key].localeCompare(b[key]) : a[key] - b[key]) * dir);
+  const tbody = document.querySelector('#t-runs tbody'); clear(tbody);
+  for (const r of rows) {
+    const tr = el('tr', {class: r.name === state.runsPinned ? 'pinned' : ''});
+    tr.addEventListener('click', () => { state.runsPinned = state.runsPinned === r.name ? null : r.name; saveState(); renderRuns(); });
+    for (const c of RUN_COLS) {
+      const td = el('td', {class: c.num ? 'num' : ''});
+      if (c.key === 'name') {
+        td.appendChild(document.createTextNode(r.name));
+        if (r.runner) td.appendChild(el('span', {class: 'badge runner'}, 'runner'));
+        if (r.isNew) td.appendChild(el('span', {class: 'badge new'}, 'new'));
+      } else if (c.key === 'trend') td.appendChild(sparkline(runWeekly(groups.get(r.name), weeks, state.runsMinWeek)));
+      else td.textContent = c.fmt ? c.fmt(r[c.key]) : r[c.key];
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  if (!rows.length) tbody.appendChild(el('tr', null, el('td', {colspan: RUN_COLS.length, class: 'muted'}, 'No rows: lower "Min runs", or widen the date window.')));
 }
 
 function exportFiltered() {
