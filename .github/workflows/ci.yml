@@ -45,3 +45,10 @@ jobs:
         run: |
           python3 tests/usage_regression.py
           node tests/report_dates.cjs
+
+      - name: Runs view tests
+        env:
+          CC_STATS_BIN: target/release/cc-stats
+        run: |
+          python3 tests/runs_regression.py
+          node tests/runs_view.cjs
