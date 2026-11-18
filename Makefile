@@ -27,6 +27,7 @@ test: ## Run unit and report regression tests
 	cargo build
 	python3 tests/usage_regression.py
 	python3 tests/runs_regression.py
+	python3 tests/outcomes_regression.py
 	node tests/report_dates.cjs
 	node tests/runs_view.cjs
 

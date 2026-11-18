@@ -60,9 +60,10 @@ const data = external || {summary: {earliest: day(0), latest: day(18), tz_offset
 
 const context = vm.createContext({console, document, Chart, localStorage: {getItem: () => null, setItem() {}}});
 vm.runInContext(script.replace('/*__CC_STATS_DATA__*/null', JSON.stringify(data)) + `
-  globalThis.api = {state, DATA, runsFiltered, runGroups, summarizeRuns, runWeekly, runPct, weekStart, weeksBetween, renderRuns, initRuns, setView, RUN_COLS};
+  globalThis.api = {state, DATA, runsFiltered, runGroups, summarizeRuns, runWeekly, runPct, weekStart, weeksBetween, renderRuns, renderRunsHeat, initRuns, setView, RUN_COLS};
 `, context);
 const {api} = context;
+assert.equal(api.state.runsOutcome, 'landed', 'merges, not commits, are the default outcome');
 const open = (from, to) => { api.state.from = from; api.state.to = to;
   api.state.projects = new Set(api.runsFiltered.call(null) && [...new Set(api.DATA.runs.map(r => r.project))]); };
 const reset = () => { created.length = 0; registry.clear(); tbody.children = []; };
@@ -204,6 +205,61 @@ assert.equal(registry.get('runs-subagents').disabled, true, 'toggle is disabled 
 api.DATA.runs_weekly_total = withSubs; registry.clear(); api.initRuns();
 assert.equal(registry.get('runs-subagents').disabled, false);
 
+// ---- what landed ----
+const base = {hours_all: 1, avg_parallel: 1, peak_parallel: 1};
+const landedWeeks = [
+  {...base, week: day(0),  hours_tracked: 40,  merged_prs: 3, other_merges: 5, landed: 8,  commits: 20},
+  {...base, week: day(7),  hours_tracked: 5,   merged_prs: 1, other_merges: 1, landed: 2,  commits: 5},   // under 10 tracked hours: no rate
+  {...base, week: day(14), hours_tracked: 50,  merged_prs: 6, other_merges: 4, landed: 10, commits: 30},
+];
+api.DATA.runs_weekly_total = landedWeeks;
+api.DATA.runs_git = {enabled: true, authors: ['me@x.io'], repos: 3, projects_total: 10, projects_tracked: 4};
+open(day(0), day(18)); api.state.runsMin = 5; api.state.runsGroup = 'trigger'; api.state.runsPinned = null;
+const out = id => created.filter(c => c.id === id).pop().cfg;
+const near = (a, b, msg) => assert.ok(Math.abs(a - b) < 1e-9, msg + ': ' + a + ' vs ' + b);
+const cardVals = () => registry.get('runs-outcome-cards').children.map(c => c.children[1].textContent);
+
+reset(); api.state.runsOutcome = 'landed'; api.renderRuns();
+assert.equal(registry.get('runs-outcomes').hidden, false);
+const cnt = out('ch-runs-out-count');
+same(cnt.data.datasets.map(d => d.label), ['merged PRs', 'other merges'], 'merges are the default, split into PRs and other merges');
+same(cnt.data.datasets.map(d => d.data), [[3, 1, 6], [5, 1, 4]]);
+assert.equal(cnt.options.scales.y.stacked, true);
+const rate = out('ch-runs-out-rate');
+near(rate.data.datasets[0].data[0], 8 / 40, 'week 1: 8 merges / 40 hours');
+assert.equal(rate.data.datasets[0].data[1], null, 'a week with under 10 tracked hours has no rate');
+near(rate.data.datasets[0].data[2], 10 / 50, 'week 3: 10 / 50');
+near(rate.data.datasets[1].data[1], 10 / 45, 'trailing rate pools the hours, not the weekly rates');
+near(rate.data.datasets[1].data[2], 20 / 95);
+same(cardVals().slice(0, 3), ['20', '55', '95.0'], 'merges landed, commits, tracked hours');
+assert.equal(cardVals()[3], '0.21', 'merges per tracked agent hour over the window (20 / 95)');
+same([cardVals()[4]], ['4 / 10'], 'coverage: projects with a repo here');
+assert.match(registry.get('runs-outcome-note').textContent, /me@x\.io/, 'says whose work is counted');
+
+reset(); api.state.runsOutcome = 'prs'; api.renderRuns();
+same(out('ch-runs-out-count').data.datasets.map(d => d.data), [[3, 1, 6]], 'PRs only');
+near(out('ch-runs-out-rate').data.datasets[0].data[2], 6 / 50);
+reset(); api.state.runsOutcome = 'commits'; api.renderRuns();
+same(out('ch-runs-out-count').data.datasets.map(d => d.data), [[20, 5, 30]], 'commits are available but not the default');
+assert.equal(cardVals()[3], '0.58', 'commits per tracked agent hour (55 / 95)');
+api.state.runsOutcome = 'landed';
+
+// a window that starts later only counts its own weeks, and its trailing rate never reaches before the window
+open(day(14), day(18)); reset(); api.renderRuns();
+same(out('ch-runs-out-count').data.datasets.map(d => d.data), [[6], [4]]);
+near(out('ch-runs-out-rate').data.datasets[1].data[0], 10 / 50, 'trailing rate uses only the weeks on screen');
+open(day(0), day(18));
+
+// --no-git, and a data.json from before git was read
+api.DATA.runs_git = {enabled: false, authors: [], repos: 0, projects_total: 0, projects_tracked: 0};
+reset(); api.renderRuns();
+assert.equal(registry.get('runs-outcome-body').hidden, true);
+assert.match(registry.get('runs-outcome-note').textContent, /--no-git/);
+delete api.DATA.runs_git;
+reset(); api.renderRuns();
+assert.equal(registry.get('runs-outcomes').hidden, true, 'older data.json: no section at all');
+api.DATA.runs_weekly_total = withSubs;
+
 // ---- names come from transcripts: they are shown as text, never parsed as markup ----
 const EVIL = '</script><img src=x onerror=alert(1)>';
 api.DATA.runs_weekly_total = withSubs;
@@ -215,5 +271,30 @@ assert.ok(registry.get('runs-trend').textContent.includes(EVIL), 'chart title sh
 assert.ok(!html.slice(html.indexOf('// ---------- Runs ----------'), html.indexOf('function exportFiltered')).match(/innerHTML|insertAdjacentHTML|document\.write/), 'the Runs code never builds markup from data');
 api.state.runsGroup = 'skill'; reset(); api.renderRuns();
 assert.ok(rowsOf().includes(EVIL + '2'), 'skill names too');
+
+// ---- when agents work together (runs_heat) ----
+const heat = [];
+for (let wd = 0; wd < 7; wd++) for (let h = 0; h < 24; h++) heat.push({weekday: wd, hour: h, hours: 0, avg_parallel: 0, peak_parallel: 0});
+const heatAt = (wd, h) => heat[wd * 24 + h];
+Object.assign(heatAt(0, 10), {hours: 10, avg_parallel: 2, peak_parallel: 3});   // the busiest cell
+Object.assign(heatAt(0, 11), {hours: 1, avg_parallel: 5, peak_parallel: 5});    // under 2 h: blank, whatever its average
+Object.assign(heatAt(0, 12), {hours: 5, avg_parallel: 1, peak_parallel: 1});    // half the top average
+api.DATA.runs_heat = heat;
+reset(); api.renderRuns();
+const heatBox = registry.get('runs-heat');
+assert.equal(heatBox.children.length, 25 + 7 * 25, 'a header row, then seven weekday rows of a label and 24 cells');
+const heatCell = (wd, h) => heatBox.children[25 + wd * 25 + 1 + h];
+assert.equal(heatCell(0, 10).style.background, 'rgba(124,158,255,1.00)', 'the top cell is full strength');
+assert.equal(heatCell(0, 10).textContent, '2.0', 'the average is printed in the cell, not only in a tooltip');
+assert.equal(heatCell(0, 12).textContent, '1.0', 'every shown cell prints its average');
+assert.equal(heatCell(0, 11).textContent, '', 'a blank cell prints nothing');
+assert.equal(heatCell(0, 11).style.background, 'transparent', 'a cell with under 2 hours is blank');
+assert.equal(heatCell(0, 12).style.background, 'rgba(124,158,255,0.54)', 'half the top average is about half the strength');
+assert.match(heatCell(0, 10).attrs.title, /Mon 10:00 · avg 2\.00 agents · peak 3 · 10\.0 h/, 'the tooltip gives the numbers');
+assert.match(registry.get('runs-heat-note').textContent, /--tz/);
+delete api.DATA.runs_heat;
+reset(); api.renderRuns();
+assert.equal(registry.get('runs-heat').children.length, 0, 'an older data.json shows no heatmap');
+assert.match(registry.get('runs-heat-note').textContent, /older cc-stats/);
 
 console.log('Runs view: aggregation, filters, charts and table behave.');

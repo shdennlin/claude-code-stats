@@ -65,6 +65,9 @@
   .tabs button.active{border-color:var(--accent);color:var(--accent);background:var(--panel)}
   .runs-controls{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));align-items:end}
   .runs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}
+  .heat{display:grid;grid-template-columns:36px repeat(24,minmax(0,1fr));gap:2px;font-size:11px;color:var(--muted)}
+  .heat-cell{height:22px;border-radius:3px;background:var(--panel2);color:var(--fg);display:flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums}
+  .heat-lab{display:flex;align-items:center}
   .runs-cell{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
   .runs-cell h3{margin:0 0 2px;font-size:13px;font-weight:600}
   .runs-cell .stats{color:var(--muted);font-size:11px;margin-bottom:6px}
@@ -354,6 +357,30 @@
       <label class="col-toggle" style="margin-bottom:8px" title="Count subagents as agents working. A main agent waiting on its own subagents is not counted on top of them."><input type="checkbox" id="runs-subagents"> Count subagents</label>
       <div class="chart-wrap tall"><canvas id="ch-runs-par"></canvas></div>
     </div>
+    <div class="panel" style="grid-column:1/-1">
+      <h2>When agents work together <span class="muted" style="font-size:12px;font-weight:normal" id="runs-heat-note"></span></h2>
+      <div id="runs-heat" class="heat"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="runs-outcomes">
+    <h2>What landed <span class="muted" style="font-size:12px;font-weight:normal">— read from git; merges say the work was accepted, commits only that it was written</span></h2>
+    <div class="runs-controls" style="margin-bottom:10px">
+      <div class="field"><label>Count</label>
+        <select id="runs-outcome-metric">
+          <option value="landed">Merges: merged PRs + other merges</option>
+          <option value="prs">Merged PRs only</option>
+          <option value="commits">Commits</option>
+        </select></div>
+    </div>
+    <div id="runs-outcome-body">
+      <div class="row" id="runs-outcome-cards" style="margin-bottom:12px"></div>
+      <div class="grid-2">
+        <div><div class="chart-wrap tall"><canvas id="ch-runs-out-count"></canvas></div></div>
+        <div><div class="chart-wrap tall"><canvas id="ch-runs-out-rate"></canvas></div></div>
+      </div>
+    </div>
+    <div class="muted" id="runs-outcome-note" style="font-size:12px;margin-top:8px"></div>
   </section>
 
   <section class="panel">
@@ -364,7 +391,7 @@
   <section class="panel">
     <h2>How to read this</h2>
     <ul class="muted" style="margin:0;padding-left:18px;font-size:12px;line-height:1.7">
-      <li><b>Duration</b> is active time: every gap between two events of a run is capped at the <code>--gap</code> threshold, so sleep, permission waits and left-open sessions do not inflate it.</li>
+      <li><b>Duration</b> is active time: every gap between two events of a run is capped at the <code>--gap</code> threshold, so sleep, permission waits and left-open sessions do not inflate it. The wait between a Bash call and its result counts up to 2 hours, since that is the command running.</li>
       <li><b>Median / P90 / P99</b>: half / nine in ten / ninety-nine in a hundred runs are shorter. Watch P90 and the weekly lines, not the median: long runs live in the tail.</li>
       <li><b>Interrupts</b> are the "[Request interrupted by user]" markers inside a run. Stepping in when you see a problem is a choice about where your attention goes, not a score to minimise; compare it with how long runs last between interruptions.</li>
       <li><b>runner</b> = at least 5 runs and at least 30% of them over 10 minutes. <b>new</b> = first seen in the last 14 days of the data.</li>
@@ -420,7 +447,7 @@ function saveState() {
       hourMetric: state.hourMetric,
       view: state.view, runsGroup: state.runsGroup, runsMin: state.runsMin, runsTop: state.runsTop,
       runsMinWeek: state.runsMinWeek, runsPlain: state.runsPlain, runsSort: state.runsSort, runsPinned: state.runsPinned,
-      runsSubagents: state.runsSubagents,
+      runsSubagents: state.runsSubagents, runsOutcome: state.runsOutcome,
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(blob));
   } catch (e) { /* quota / private mode — silently ignore */ }
@@ -453,6 +480,7 @@ function loadState() {
     for (const k of ['runsMin', 'runsTop', 'runsMinWeek']) if (Number.isFinite(s[k]) && s[k] > 0) state[k] = s[k];
     if (typeof s.runsPlain === 'boolean') state.runsPlain = s.runsPlain;
     if (typeof s.runsSubagents === 'boolean') state.runsSubagents = s.runsSubagents;
+    if (['landed', 'prs', 'commits'].includes(s.runsOutcome)) state.runsOutcome = s.runsOutcome;
     if (s.runsSort && s.runsSort.key) state.runsSort = s.runsSort;
     if (typeof s.runsPinned === 'string' || s.runsPinned === null) state.runsPinned = s.runsPinned;
     return true;
@@ -629,6 +657,7 @@ const state = {
   runsSort: {key: 'hours', dir: -1},
   runsPinned: null,      // trigger pinned first in the charts
   runsSubagents: true,   // parallelism chart counts subagents
+  runsOutcome: 'landed', // 'landed' | 'prs' | 'commits' — what the What-landed charts count
 };
 
 function startResize(ev, th, key) {
@@ -1986,6 +2015,7 @@ function initRuns() {
   g('runs-minweek').value = state.runsMinWeek;
   g('runs-plain').checked = state.runsPlain;
   g('runs-subagents').checked = state.runsSubagents;
+  g('runs-outcome-metric').value = state.runsOutcome;
   g('runs-subagents').disabled = !hasSubagentParallelism();
   const apply = () => { saveState(); renderRuns(); };
   g('runs-group').addEventListener('change', e => { state.runsGroup = e.target.value; state.runsPinned = null; apply(); });
@@ -1994,6 +2024,7 @@ function initRuns() {
   g('runs-minweek').addEventListener('change', e => { state.runsMinWeek = Math.max(1, Number(e.target.value) || 1); apply(); });
   g('runs-plain').addEventListener('change', e => { state.runsPlain = e.target.checked; apply(); });
   g('runs-subagents').addEventListener('change', e => { state.runsSubagents = e.target.checked; apply(); });
+  g('runs-outcome-metric').addEventListener('change', e => { state.runsOutcome = e.target.value; apply(); });
   for (const b of document.querySelectorAll('#view-tabs button')) b.addEventListener('click', () => setView(b.dataset.view));
   setView(state.view, true);
 }
@@ -2022,6 +2053,8 @@ function renderRuns() {
   renderRunsTrend(groups, rows, weeks);
   renderRunsHours(runs, weeks);
   renderRunsParallel(weeks);
+  renderRunsHeat();
+  renderRunsOutcomes(weeks);
   renderRunsTable(rows.filter(r => r.runs >= state.runsMin), groups, weeks);
 }
 
@@ -2158,6 +2191,121 @@ function renderRunsParallel(weeks) {
     options: {maintainAspectRatio: false, animation: false,
       scales: {x: {ticks: {color: C_TEXT, maxTicksLimit: 8}, grid: {color: C_GRID}},
                y: {beginAtZero: true, title: {display: true, text: 'agents working', color: C_TEXT}, ticks: {color: C_TEXT, precision: 0}, grid: {color: C_GRID}}},
+      plugins: {legend: {labels: {color: C_TEXT}}}},
+  });
+}
+
+// ---------- When agents work together ----------
+// Weekday x local hour, over the whole window (the week filter does not apply: a weekday-hour cell pools every week).
+// Built from cc-stats' runs_heat, so the time zone is the one given to --tz. Cells under HEAT_MIN_HOURS are left blank:
+// an hour of the day that was worked in once or twice says nothing about when you work.
+const HEAT_MIN_HOURS = 2;
+const HEAT_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+function renderRunsHeat() {
+  const box = document.getElementById('runs-heat'), note = document.getElementById('runs-heat-note');
+  clear(box);
+  const cells = DATA.runs_heat || [];
+  if (!cells.length) {
+    note.textContent = '— not in this data.json (made by an older cc-stats)';
+    return;
+  }
+  note.textContent = '— average agents working, by when the work started (local time, as set by --tz)';
+  const at = new Map(cells.map(c => [c.weekday * 24 + c.hour, c]));
+  const shown = cells.filter(c => c.hours >= HEAT_MIN_HOURS);
+  const top = shown.reduce((a, c) => Math.max(a, c.avg_parallel), 0) || 1;
+  box.append(el('div', {class: 'heat-lab'}), ...Array.from({length: 24}, (_, h) => el('div', {class: 'heat-lab', style: 'justify-content:center'}, h % 3 === 0 ? String(h) : '')));
+  HEAT_DAYS.forEach((day, wd) => {
+    box.append(el('div', {class: 'heat-lab'}, day));
+    for (let h = 0; h < 24; h++) {
+      const c = at.get(wd * 24 + h) || {hours: 0, avg_parallel: 0, peak_parallel: 0};
+      const cell = el('div', {class: 'heat-cell'});
+      if (c.hours >= HEAT_MIN_HOURS) {
+        const alpha = 0.08 + 0.92 * Math.min(1, c.avg_parallel / top);
+        cell.style.background = 'rgba(124,158,255,' + alpha.toFixed(2) + ')';
+        cell.textContent = c.avg_parallel.toFixed(1);   // the number is on the cell itself, not behind a hover
+        cell.setAttribute('title', day + ' ' + String(h).padStart(2, '0') + ':00 · avg ' + c.avg_parallel.toFixed(2) + ' agents · peak ' + c.peak_parallel + ' · ' + c.hours.toFixed(1) + ' h');
+      } else {
+        cell.style.background = 'transparent';
+        cell.setAttribute('title', day + ' ' + String(h).padStart(2, '0') + ':00 · too little time to read (' + c.hours.toFixed(1) + ' h)');
+      }
+      box.append(cell);
+    }
+  });
+}
+
+// ---------- What landed ----------
+// Counts come from git (cc-stats reads it): merged PRs and other merges into the integration branches, and
+// commits. Per-hour figures divide by the agent hours of projects that have a git repo on the machine that
+// ran cc-stats, so projects git cannot see do not dilute them. Like the parallelism chart this ignores the
+// project selection: cc-stats counted per week, not per project.
+const OUTCOME_MIN_HOURS = 10;  // a week or trailing window with fewer tracked agent hours gives no rate (a small denominator swings wildly)
+const OUTCOME_ROLL = 4;        // trailing weeks in the smoothed rate
+const OUTCOME_METRICS = {
+  landed:  {label: 'merges',      count: w => w.landed || 0,      stack: [['merged_prs', 'merged PRs', '#5dd39e'], ['other_merges', 'other merges', '#7c9eff']]},
+  prs:     {label: 'merged PRs',  count: w => w.merged_prs || 0,  stack: [['merged_prs', 'merged PRs', '#5dd39e']]},
+  commits: {label: 'commits',     count: w => w.commits || 0,     stack: [['commits', 'commits', '#a978ff']]},
+};
+function hasOutcomes() { return !!(DATA.runs_git && DATA.runs_git.enabled); }
+function outcomeSeries() {  // every week from the first to the last with data, so a trailing window never starts inside a gap
+  const rows = new Map((DATA.runs_weekly_total || []).map(w => [w.week, w]));
+  const keys = Array.from(rows.keys()).sort();
+  if (!keys.length) return [];
+  return weeksBetween(keys[0], keys[keys.length - 1]).map(w => rows.get(w) || {week: w, hours_tracked: 0});
+}
+function outcomeRates(series, metric) {  // weekly and trailing rate per tracked agent hour, aligned with `series`
+  const m = OUTCOME_METRICS[metric] || OUTCOME_METRICS.landed;
+  return series.map((w, i) => {
+    const win = series.slice(Math.max(0, i - OUTCOME_ROLL + 1), i + 1);
+    const hrs = win.reduce((a, x) => a + (x.hours_tracked || 0), 0);
+    const n = win.reduce((a, x) => a + m.count(x), 0);
+    const h = w.hours_tracked || 0;
+    return {week: w.week, weekly: h >= OUTCOME_MIN_HOURS ? m.count(w) / h : null, rolling: hrs >= OUTCOME_MIN_HOURS ? n / hrs : null};
+  });
+}
+function renderRunsOutcomes(weeks) {
+  const panel = document.getElementById('runs-outcomes');
+  const present = !!DATA.runs_git;
+  panel.hidden = !present;
+  if (!present) return;
+  const body = document.getElementById('runs-outcome-body'), note = document.getElementById('runs-outcome-note');
+  body.hidden = !hasOutcomes();
+  if (!hasOutcomes()) { note.textContent = 'Git was not read (cc-stats ran with --no-git).'; return; }
+  const g = DATA.runs_git, m = OUTCOME_METRICS[state.runsOutcome] || OUTCOME_METRICS.landed;
+  const series = outcomeSeries(), by = new Map(series.map(w => [w.week, w]));
+  const inWin = weeks.map(w => by.get(w) || {week: w, hours_tracked: 0});
+  const hours = inWin.reduce((a, w) => a + (w.hours_tracked || 0), 0);
+  const total = inWin.reduce((a, w) => a + m.count(w), 0);
+  const sum = k => inWin.reduce((a, w) => a + (w[k] || 0), 0);
+  const box = document.getElementById('runs-outcome-cards'); clear(box);
+  box.append(
+    runCard('Merges landed', fmtInt(sum('landed')), fmtInt(sum('merged_prs')) + ' PRs + ' + fmtInt(sum('other_merges')) + ' other merges'),
+    runCard('Commits', fmtInt(sum('commits')), 'for comparison'),
+    runCard('Tracked agent hours', fmtNum(hours, 1), 'in projects with a git repo here'),
+    runCard('Per agent hour (' + m.label + ')', hours >= OUTCOME_MIN_HOURS ? fmtNum(total / hours, 2) : 'n/a', 'window total, ' + fmtInt(total) + ' ' + m.label),
+    runCard('Coverage', fmtInt(g.projects_tracked) + ' / ' + fmtInt(g.projects_total), 'projects with a repo here, ' + fmtInt(g.repos) + ' repos'),
+  );
+  note.textContent = 'Counts are yours only' + ((g.authors || []).length ? ' (' + g.authors.join(', ') + ')' : '') + '. Merges are read from main, master, develop, dev, development and trunk; '
+    + 'a merge of one of those into another is not counted. A repo whose path no longer exists on this machine is invisible, which is why per-hour figures use only the hours of projects git can see.';
+  makeChart('ch-runs-out-count', {
+    type: 'bar',
+    data: {labels: weeks, datasets: m.stack.map(([key, label, color]) => ({label, data: inWin.map(w => w[key] || 0), backgroundColor: color + 'cc', borderColor: color, borderWidth: 1}))},
+    options: {maintainAspectRatio: false, animation: false, interaction: {mode: 'index', intersect: false},
+      scales: {x: {stacked: true, ticks: {color: C_TEXT, maxTicksLimit: 8}, grid: {color: C_GRID}},
+               y: {stacked: true, beginAtZero: true, title: {display: true, text: m.label + ' per week', color: C_TEXT}, ticks: {color: C_TEXT, precision: 0}, grid: {color: C_GRID}}},
+      plugins: {legend: {labels: {color: C_TEXT}}}},
+  });
+  // rates pool only the weeks on screen: a trailing window must not reach into weeks the chart does not show
+  const rates = new Map(outcomeRates(inWin, state.runsOutcome).map(r => [r.week, r]));
+  const at = w => rates.get(w) || {weekly: null, rolling: null};
+  makeChart('ch-runs-out-rate', {
+    type: 'line',
+    data: {labels: weeks, datasets: [
+      {label: 'week', data: weeks.map(w => at(w).weekly), showLine: false, borderColor: C_ACCENT, backgroundColor: 'rgba(124,158,255,.5)', pointRadius: 3, spanGaps: false},
+      {label: OUTCOME_ROLL + '-week trailing', data: weeks.map(w => at(w).rolling), borderColor: C_GOOD, backgroundColor: C_GOOD, borderWidth: 2, pointRadius: 0, tension: 0.25, spanGaps: false},
+    ]},
+    options: {maintainAspectRatio: false, animation: false,
+      scales: {x: {ticks: {color: C_TEXT, maxTicksLimit: 8}, grid: {color: C_GRID}},
+               y: {beginAtZero: true, title: {display: true, text: m.label + ' per tracked agent hour', color: C_TEXT}, ticks: {color: C_TEXT}, grid: {color: C_GRID}}},
       plugins: {legend: {labels: {color: C_TEXT}}}},
   });
 }
