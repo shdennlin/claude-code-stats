@@ -178,7 +178,9 @@ pub fn tally_landings(
 
 /// Run git in `dir`. Paths come from transcripts, so keep git from doing anything but reading history:
 /// no prompts, no optional locks, no fsmonitor hook. `log.showSignature` is forced off: a repository's own
-/// config could otherwise turn it on and make `git log` run its `gpg.program` on signed commits.
+/// config could otherwise turn it on and make `git log` run its `gpg.program` on signed commits. Reading a
+/// missing object would make git lazy-fetch it from a promisor remote, which a repository's config can point
+/// at an `ext::` helper that runs a command, so lazy fetch is off and the `ext` transport is refused.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .args([
@@ -188,12 +190,15 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
             "core.pager=cat",
             "-c",
             "log.showSignature=false",
+            "-c",
+            "protocol.ext.allow=never",
             "-C",
         ])
         .arg(dir)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("LC_ALL", "C")
         .output()
         .ok()?;

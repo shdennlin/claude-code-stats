@@ -66,7 +66,7 @@
   .runs-controls{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));align-items:end}
   .runs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}
   .heat{display:grid;grid-template-columns:36px repeat(24,minmax(0,1fr));gap:2px;font-size:11px;color:var(--muted)}
-  .heat-cell{height:22px;border-radius:3px;background:var(--panel2)}
+  .heat-cell{height:22px;border-radius:3px;background:var(--panel2);color:var(--fg);display:flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums}
   .heat-lab{display:flex;align-items:center}
   .runs-cell{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
   .runs-cell h3{margin:0 0 2px;font-size:13px;font-weight:600}
@@ -2222,6 +2222,7 @@ function renderRunsHeat() {
       if (c.hours >= HEAT_MIN_HOURS) {
         const alpha = 0.08 + 0.92 * Math.min(1, c.avg_parallel / top);
         cell.style.background = 'rgba(124,158,255,' + alpha.toFixed(2) + ')';
+        cell.textContent = c.avg_parallel.toFixed(1);   // the number is on the cell itself, not behind a hover
         cell.setAttribute('title', day + ' ' + String(h).padStart(2, '0') + ':00 · avg ' + c.avg_parallel.toFixed(2) + ' agents · peak ' + c.peak_parallel + ' · ' + c.hours.toFixed(1) + ' h');
       } else {
         cell.style.background = 'transparent';

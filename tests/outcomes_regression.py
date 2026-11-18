@@ -200,6 +200,44 @@ class RepoConfigCannotRunPrograms(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertFalse(marker.exists(), 'the repository config ran gpg.program')
 
+    def test_a_missing_object_is_not_lazy_fetched_through_an_ext_remote(self):
+        # a ref to a commit this clone does not have, and a promisor remote whose URL runs a command
+        with tempfile.TemporaryDirectory(prefix='cc-stats-lazy-') as tmp:
+            base = Path(tmp)
+            home = base / 'home'
+            home.mkdir()
+            repo = base / 'repo'
+            g = Git(repo, home)
+            repo.mkdir()
+            g.run('init', '-q', '-b', 'main')
+            g.run('config', 'user.email', ME)
+            g.commit('init', '2026-11-02T09:00:00+00:00')
+            ghost = subprocess.run(['git', '-C', str(repo), 'hash-object', '-t', 'commit', '--stdin'], input=(
+                f'tree {g.run("rev-parse", "HEAD^{tree}").strip()}\nauthor {ME} <{ME}> 1 +0000\n'
+                f'committer {ME} <{ME}> 1 +0000\n\nghost\n'), capture_output=True, text=True, check=True).stdout.strip()
+            (repo / '.git/refs/heads/ghost').write_text(ghost + '\n')   # update-ref would refuse a missing object
+            marker = base / 'ran'
+            helper = base / 'evil-helper'
+            helper.write_text(f'#!/bin/sh\ntouch {marker}\nexit 1\n')
+            helper.chmod(0o755)
+            g.run('config', 'extensions.partialClone', 'origin')
+            g.run('config', 'remote.origin.promisor', 'true')
+            g.run('config', 'remote.origin.url', f'ext::{helper}')
+            g.run('config', 'protocol.ext.allow', 'always')
+
+            projects = base / 'projects'
+            rows = [prompt('2026-11-03T12:00:00Z', 'lazy', 'work', str(repo)), assistant('2026-11-03T12:10:00Z', [], str(repo))]
+            (projects / 'proj-lazy').mkdir(parents=True)
+            (projects / 'proj-lazy/s.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            # only HOME is isolated: with GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM both set, git does not run the helper
+            # and the test could not tell a fixed build from an unfixed one
+            env = {**os.environ, 'HOME': str(home)}
+            env.pop('GIT_CONFIG_GLOBAL', None); env.pop('GIT_CONFIG_NOSYSTEM', None)
+            r = subprocess.run([str(BIN), '--dir', str(projects), '--out', str(base / 'out'), '--all', '--tz', 'UTC',
+                                '--format', 'json'], capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(marker.exists(), 'a missing object was lazy-fetched through the ext remote')
+
 
 if __name__ == '__main__':
     unittest.main()
