@@ -44,6 +44,12 @@ def interrupt(ts, cwd='/fixture/a'):
     return _base('user', ts, cwd, message={'role': 'user', 'content': [{'type': 'text', 'text': '[Request interrupted by user]'}]})
 
 
+def tool_call(ts, name, cwd='/fixture/a'):
+    return _base('assistant', ts, cwd, requestId=_id(), message={
+        'id': _id(), 'model': 'claude-opus-5', 'content': [{'type': 'tool_use', 'id': 't', 'name': name, 'input': {}}],
+        'usage': {'input_tokens': 1, 'output_tokens': 1}})
+
+
 # p1: /spectra-apply, one interrupt mid-run, then a 3 h silence that must be capped at the 15 min gap
 P1 = [command('2026-11-02T10:00:00Z', 'p1', 'spectra-apply'), assistant('2026-11-02T10:00:30Z'),
       tool_result('2026-11-02T10:01:00Z'), assistant('2026-11-02T10:10:00Z'), interrupt('2026-11-02T10:10:05Z'),
@@ -168,6 +174,87 @@ class RunsRegression(unittest.TestCase):
 
 
 EVIL = '</script><img src=x onerror=alert(1)>'
+
+
+class BashWaitRegression(unittest.TestCase):
+    """A Bash call's wait is the command running, so it may exceed the 15 min cap (up to 2 h); other waits may not."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix='cc-stats-bash-')
+        base = Path(cls.tmp.name)
+        cwd = '/fixture/bash'
+        rows = [
+            # 2026-11-20: a 60 min Bash command -> all 60 min count (3600 + 10 + 10)
+            prompt('2026-11-20T10:00:00Z', 'b1', 'build', cwd), tool_call('2026-11-20T10:00:10Z', 'Bash', cwd),
+            tool_result('2026-11-20T11:00:10Z', cwd), assistant('2026-11-20T11:00:20Z', cwd=cwd),
+            # 2026-11-21: a 60 min wait after a Read is idle time -> capped at 15 min (900 + 10 + 10)
+            prompt('2026-11-21T10:00:00Z', 'b2', 'read', cwd), tool_call('2026-11-21T10:00:10Z', 'Read', cwd),
+            tool_result('2026-11-21T11:00:10Z', cwd), assistant('2026-11-21T11:00:20Z', cwd=cwd),
+            # 2026-11-22: a 3 h Bash command -> capped at the 2 h Bash cap (7200 + 10 + 10)
+            prompt('2026-11-22T10:00:00Z', 'b3', 'long', cwd), tool_call('2026-11-22T10:00:10Z', 'Bash', cwd),
+            tool_result('2026-11-22T13:00:10Z', cwd), assistant('2026-11-22T13:00:20Z', cwd=cwd),
+            # 2026-11-23: a Bash call answered by an interrupt marker 3 h later is idle, not a result (900 + 10 + 10)
+            prompt('2026-11-23T10:00:00Z', 'b4', 'interrupted', cwd), tool_call('2026-11-23T10:00:10Z', 'Bash', cwd),
+            interrupt('2026-11-23T13:00:10Z', cwd), assistant('2026-11-23T13:00:20Z', cwd=cwd),
+        ]
+        path = base / 'projects/proj-bash/s.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        subprocess.run([str(BIN), '--dir', str(base / 'projects'), '--out', str(base / 'out'),
+                        '--all', '--tz', 'UTC', '--format', 'json'], capture_output=True, text=True, check=True)
+        cls.data = json.loads((base / 'out/data.json').read_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_only_the_bash_wait_gets_the_two_hour_cap(self):
+        durations = {r['date']: r['dur_sec'] for r in self.data['runs']}
+        self.assertEqual(durations, {'2026-11-20': 3620, '2026-11-21': 920, '2026-11-22': 7220, '2026-11-23': 920})
+
+
+class HeatmapRegression(unittest.TestCase):
+    """runs_heat: agent time by weekday and local hour. Monday 2026-11-16 (weekday 0), UTC."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix='cc-stats-heat-')
+        base = Path(cls.tmp.name)
+        cwd = '/fixture/heat'
+        rows = [
+            # every step stays under the 15 min gap cap, so the full 30 min (hour 10) and 20 min (hour 14) count
+            prompt('2026-11-16T10:00:00Z', 'h1', 'morning', cwd), assistant('2026-11-16T10:10:00Z', cwd=cwd),
+            assistant('2026-11-16T10:20:00Z', cwd=cwd), assistant('2026-11-16T10:30:00Z', cwd=cwd),
+            prompt('2026-11-16T14:00:00Z', 'h2', 'afternoon', cwd), assistant('2026-11-16T14:10:00Z', cwd=cwd),
+            assistant('2026-11-16T14:20:00Z', cwd=cwd),
+        ]
+        path = base / 'projects/proj-heat/s.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        subprocess.run([str(BIN), '--dir', str(base / 'projects'), '--out', str(base / 'out'),
+                        '--all', '--tz', 'UTC', '--format', 'json'], capture_output=True, text=True, check=True)
+        cls.data = json.loads((base / 'out/data.json').read_text())
+        cls.cells = {(c['weekday'], c['hour']): c for c in cls.data['runs_heat']}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_every_weekday_hour_has_a_cell(self):
+        self.assertEqual(len(self.cells), 168)
+
+    def test_work_lands_in_the_hour_it_started_in(self):
+        self.assertAlmostEqual(self.cells[(0, 10)]['hours'], 0.5)
+        self.assertAlmostEqual(self.cells[(0, 14)]['hours'], 1 / 3)
+        self.assertEqual((self.cells[(0, 11)]['hours'], self.cells[(0, 11)]['avg_parallel']), (0, 0))
+
+    def test_one_agent_at_a_time_averages_and_peaks_at_one(self):
+        self.assertEqual((self.cells[(0, 10)]['avg_parallel'], self.cells[(0, 10)]['peak_parallel']), (1, 1))
+
+    def test_the_cells_add_up_to_the_weekly_agent_hours(self):
+        weekly = sum(w['hours_all'] for w in self.data['runs_weekly_total'])
+        self.assertAlmostEqual(sum(c['hours'] for c in self.cells.values()), weekly)
 
 
 class ReportEmbedding(unittest.TestCase):

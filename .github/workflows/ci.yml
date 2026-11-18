@@ -51,4 +51,5 @@ jobs:
           CC_STATS_BIN: target/release/cc-stats
         run: |
           python3 tests/runs_regression.py
+          python3 tests/outcomes_regression.py
           node tests/runs_view.cjs

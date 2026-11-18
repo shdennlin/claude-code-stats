@@ -78,6 +78,8 @@ cc-stats --project myproject -p frontend  # filter (repeatable substring match)
 cc-stats --merge "myproject=Project-A"    # merge matching projects under one label
 cc-stats --gap 30                         # active-time gap threshold (minutes; default 15)
 cc-stats --run-exclude my-notes           # leave a slash command out of the Runs view (repeatable)
+cc-stats --git-author me@example.com     # whose merges and commits count as yours (default: each repo's git user.email)
+cc-stats --no-git                         # do not read git (no merged-PR / commit outcomes)
 cc-stats --tz "+08:00"                    # force timezone for buckets (default: system local)
 cc-stats --format html                    # html only (default: all = json+csv+html)
 cc-stats --open                           # open report.html after generating
@@ -94,7 +96,7 @@ The HTML viewer also supports merge rules interactively (no rerun needed) — us
 
 | File | Contents |
 |---|---|
-| `data.json` | Full structured report — `summary`, `projects`, `sessions`, `session_days`, `daily`, `by_model`, `by_skill`, `by_plugin`, `by_tool`, `by_mcp_server`, `by_content_type`, `by_stop_reason`, `by_branch`, `by_hour`, `by_weekday`, plus the Runs view: `runs`, `by_trigger`, `runs_weekly`, `runs_weekly_total`. |
+| `data.json` | Full structured report — `summary`, `projects`, `sessions`, `session_days`, `daily`, `by_model`, `by_skill`, `by_plugin`, `by_tool`, `by_mcp_server`, `by_content_type`, `by_stop_reason`, `by_branch`, `by_hour`, `by_weekday`, plus the Runs view: `runs`, `by_trigger`, `runs_weekly`, `runs_weekly_total`, `runs_git`. |
 | `daily.csv` / `projects.csv` / `sessions.csv` | Flat CSVs for spreadsheet drilling. |
 | `report.html` | Self-contained interactive viewer (data embedded). Open in any browser. Filters, charts, sortable tables, drilldown, localStorage-persisted state. |
 
@@ -119,6 +121,10 @@ The HTML viewer also supports merge rules interactively (no rerun needed) — us
 | **Interrupts** | `[Request interrupted by user]` markers inside a run, and whether the run ended on one. An observation of where you stepped in, not a score. |
 | **runner / new** | `runner` = at least 5 runs and 30% of them over 10 minutes. `new` = first seen in the last 14 days of the data. |
 | **Run parallelism** | Per week, agent hours / wall-clock hours with any agent working (and the peak number at once), from the run intervals of the main sessions. `*_all` fields count subagents too, as threads that are working: while a main session has a subagent working, its own waiting time is not counted, so one subagent running alone is 1, not 2, and two at once are 2. Also `subagent_hours` and `peak_subagents`. A segment belongs to the week it starts in. |
+| **When agents work together** | `runs_heat`: 168 rows, one per weekday × local hour (`--tz`), over the whole window. Each row has the agent hours that started in that hour, and the average (time-weighted, while any agent in that cell was working) and peak number at once. Intervals are split at hour boundaries, so a run that crosses 10:00 counts in both hours. Its total equals the sum of the weekly `hours_all`. |
+| **Landed (merges)** | What was accepted, read from local git history (no network). A *merged PR* is a first-parent commit on an integration branch whose subject names a PR (`(#123)`, `Merge pull request #123`). *Other merges* are merge commits without a PR number. Read from origin/HEAD's branch plus `main`, `master`, `develop`, `dev`, `development`, `trunk` where they exist, because many repos integrate on `develop` while origin/HEAD points at `main`. A merge whose source is one of those branches (a back-merge of `main` into `develop`, a release merge) is housekeeping and not counted, nor is `git pull` syncing the remote. Merges matter more than commits: a merge says the work was accepted. |
+| **Commits** | Non-merge commits by you on any local or remote branch, each counted once however many clones or worktrees hold it. Kept for comparison. |
+| **Per agent hour** | Landed (or PRs, or commits) divided by *tracked* agent hours: the working-thread hours of projects whose working directory is a git repo on this machine. Projects git cannot see (a deleted temp dir, another machine's backup) are left out of the denominator so they do not dilute it. `runs_git` reports how many projects were covered. Your author emails are cleared by `--anonymize`. |
 | **Git branch** | Per-branch active / messages / cost. |
 | **Session titles** | From `ai-title` / `custom-title` events (custom overrides AI-generated). |
 

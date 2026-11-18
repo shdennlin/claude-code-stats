@@ -3,7 +3,7 @@ use chrono::{DateTime, Datelike, FixedOffset, Local, NaiveDate, TimeZone, Timeli
 use clap::Parser;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,8 @@ static TZ: OnceLock<FixedOffset> = OnceLock::new();
 fn tz() -> &'static FixedOffset {
     TZ.get().expect("tz not initialized")
 }
+
+mod git_outcomes;
 
 const REPORT_HTML_TEMPLATE: &str = include_str!("../templates/report.html");
 
@@ -87,6 +89,15 @@ struct Args {
     /// Scan ALL history (disables --days default).
     #[arg(long)]
     all: bool,
+
+    /// Do not read git. Skips the merged-PR / commit outcomes of the Runs view (and runs no git commands).
+    #[arg(long)]
+    no_git: bool,
+
+    /// Author email whose merged PRs and commits count as yours (repeatable). Default: the git
+    /// `user.email` of each repo.
+    #[arg(long, value_name = "EMAIL")]
+    git_author: Vec<String>,
 
     /// Slash command to leave out of the runs view (repeatable, case-insensitive), on top of the
     /// built-in local commands such as /compact and /model. E.g. --run-exclude my-notes
@@ -558,6 +569,7 @@ struct Event {
     command: Option<String>, // slash command typed in a human prompt, e.g. "spectra-apply"
     skills: Vec<String>,     // Skill tool_use inputs in this assistant message
     interrupted: bool,       // "[Request interrupted by user...]" marker
+    tool_result: bool,       // user line carrying a tool_result block: the answer to a tool call
     sidechain: bool,         // subagent traffic: never part of a main-session run
     uuid: Option<String>,
 }
@@ -1002,7 +1014,9 @@ struct Report {
     runs: Vec<Run>,                  // one per human prompt that the agent answered
     by_trigger: Vec<TriggerStat>,    // runs grouped by slash command / first skill, auto-discovered
     runs_weekly: Vec<WeeklyTrigger>, // week x trigger
-    runs_weekly_total: Vec<WeeklyTotal>, // week: agent hours, wall-clock hours, parallelism
+    runs_weekly_total: Vec<WeeklyTotal>, // week: agent hours, wall-clock hours, parallelism, what landed
+    runs_heat: Vec<HeatCell>, // weekday x local hour: when agents work, and how many at once
+    runs_git: git_outcomes::GitSummary, // which repos and authors the merge/commit counts cover
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
@@ -1174,6 +1188,13 @@ fn parse_event(v: &Value) -> Option<Event> {
         .get("isSidechain")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let tool_result = typ == "user"
+        && v.pointer("/message/content")
+            .and_then(Value::as_array)
+            .is_some_and(|b| {
+                b.iter()
+                    .any(|x| x.get("type").and_then(Value::as_str) == Some("tool_result"))
+            });
     let (role, interrupted, command) = match typ {
         "assistant" => (Role::Assistant, false, None),
         "user" => {
@@ -1194,6 +1215,7 @@ fn parse_event(v: &Value) -> Option<Event> {
         command,
         skills,
         interrupted,
+        tool_result,
         sidechain,
         uuid: v.get("uuid").and_then(Value::as_str).map(String::from),
         billing_key,
@@ -1311,6 +1333,8 @@ fn anonymize_report(r: &mut Report) {
         day.session.title = titles.get(&day.session.file).cloned().flatten();
         day.session.file.clear();
     }
+    // git author emails identify the person: a public demo must not carry them
+    r.runs_git.authors.clear();
     // project.cwd (raw cwd not affected by --merge)
     for p in &mut r.projects {
         p.cwd = None;
@@ -1414,7 +1438,7 @@ const LOCAL_COMMANDS: &[&str] = &[
 struct Run {
     date: String, // scan-tz date of the prompt
     start: i64,   // prompt time, unix seconds
-    dur_sec: u64, // active time: every gap between consecutive events is capped at `--gap`
+    dur_sec: u64, // active time: gaps between consecutive events are capped (see `step_cap`)
     trigger: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skills: Vec<String>, // every Skill the agent invoked during the run
@@ -1436,14 +1460,57 @@ struct RunBuild {
 /// Active time of one subagent transcript, tied to the main session that spawned it.
 struct SubWork {
     session: String,
+    project: String,
     segs: Vec<(i64, i64)>,
+}
+
+/// One transcript line as the active-time timeline sees it.
+#[derive(Debug, Clone, Copy)]
+struct Tick {
+    t: i64,            // unix seconds
+    bash: bool,        // an assistant line that called the Bash tool
+    tool_result: bool, // a user line answering a tool call
+}
+
+impl Tick {
+    fn of(e: &Event) -> Tick {
+        Tick {
+            t: e.dt_utc.timestamp(),
+            bash: e.tools.iter().any(|n| n == "Bash"),
+            tool_result: e.tool_result,
+        }
+    }
+}
+
+/// Longest gap that still counts as work when a Bash call is waiting for its result: the command
+/// running. Every other gap is idle time (user away, permission prompt) and gets `--gap`.
+const BASH_GAP_CAP_SEC: i64 = 2 * 3600;
+
+/// Cap for the step from `a` to `b`. Never below `gap_sec`, so a `--gap` above two hours still applies.
+fn step_cap(a: Tick, b: Tick, gap_sec: i64) -> i64 {
+    if a.bash && b.tool_result {
+        BASH_GAP_CAP_SEC.max(gap_sec)
+    } else {
+        gap_sec
+    }
+}
+
+/// (start, end) of every step between consecutive lines, each step clamped by `step_cap`.
+fn steps(ticks: &[Tick], gap_sec: i64) -> Vec<(i64, i64)> {
+    ticks
+        .windows(2)
+        .map(|w| {
+            let step = (w[1].t - w[0].t).clamp(0, step_cap(w[0], w[1], gap_sec));
+            (w[0].t, w[0].t + step)
+        })
+        .collect()
 }
 
 #[derive(Default)]
 struct RunAcc {
     uuid: Option<String>,
     command: Option<String>,
-    times: Vec<i64>,
+    ticks: Vec<Tick>,
     skills: Vec<String>,
     interrupts: u32,
     ended_by_interrupt: bool,
@@ -1471,20 +1538,15 @@ fn build_runs(events: &[Event], gap_sec: i64, exclude: &[String]) -> Vec<RunBuil
             .clone()
             .or_else(|| a.skills.first().cloned())
             .unwrap_or_else(|| PLAIN_PROMPT.to_string());
-        let mut dur = 0u64;
-        let mut segs = Vec::new();
-        for w in a.times.windows(2) {
-            let step = (w[1] - w[0]).clamp(0, gap_sec);
-            dur += step as u64;
-            segs.push((w[0], w[0] + step));
-        }
+        let segs = steps(&a.ticks, gap_sec);
+        let dur: u64 = segs.iter().map(|(s, z)| (z - s) as u64).sum();
         let mut skills: Vec<String> = Vec::new();
         for s in a.skills {
             if s != trigger && !skills.contains(&s) {
                 skills.push(s);
             }
         }
-        let start = a.times[0];
+        let start = a.ticks[0].t;
         out.push(RunBuild {
             run: Run {
                 date: String::new(),
@@ -1496,7 +1558,7 @@ fn build_runs(events: &[Event], gap_sec: i64, exclude: &[String]) -> Vec<RunBuil
                 ended_by_interrupt: a.ended_by_interrupt,
                 project: String::new(),
                 uuid: a.uuid,
-                events: a.times.len(),
+                events: a.ticks.len(),
             },
             segs,
             session: String::new(),
@@ -1506,19 +1568,18 @@ fn build_runs(events: &[Event], gap_sec: i64, exclude: &[String]) -> Vec<RunBuil
         if e.sidechain || e.role == Role::Other {
             continue;
         }
-        let t = e.dt_utc.timestamp();
         if e.role == Role::HumanPrompt {
             finish(cur.take(), &mut out);
             cur = Some(RunAcc {
                 uuid: e.uuid.clone(),
                 command: e.command.clone(),
-                times: vec![t],
+                ticks: vec![Tick::of(e)],
                 ..Default::default()
             });
             continue;
         }
         let Some(a) = cur.as_mut() else { continue };
-        a.times.push(t);
+        a.ticks.push(Tick::of(e));
         a.ended_by_interrupt = e.interrupted;
         if e.interrupted {
             a.interrupts += 1;
@@ -1618,6 +1679,17 @@ struct WeeklyTotal {
     union_hours_all: f64,
     avg_parallel_all: f64,
     peak_parallel_all: u32,
+    // What landed, from git (see git_outcomes). Merges matter more than commits: a merge says the work
+    // was accepted. The per-hour figures divide by `hours_tracked`: working-thread hours of only those
+    // projects whose working directory is a git repo here, so projects git cannot see do not dilute them.
+    hours_tracked: f64,
+    merged_prs: u64,
+    other_merges: u64,
+    landed: u64, // merged_prs + other_merges
+    commits: u64,
+    landed_per_agent_hour: f64,
+    prs_per_agent_hour: f64,
+    commits_per_agent_hour: f64,
 }
 
 fn summarize_triggers(runs: &[Run]) -> Vec<TriggerStat> {
@@ -1712,14 +1784,13 @@ fn weekly_triggers(runs: &[Run]) -> Vec<WeeklyTrigger> {
 /// Gap-capped active segments of one transcript, from every user/assistant line (a subagent's own
 /// lines are all sidechain, so unlike `build_runs` nothing is skipped on that account).
 fn agent_segments(events: &[Event], gap_sec: i64) -> Vec<(i64, i64)> {
-    let times: Vec<i64> = events
+    let ticks: Vec<Tick> = events
         .iter()
         .filter(|e| e.role != Role::Other)
-        .map(|e| e.dt_utc.timestamp())
+        .map(Tick::of)
         .collect();
-    times
-        .windows(2)
-        .map(|w| (w[0], w[0] + (w[1] - w[0]).clamp(0, gap_sec)))
+    steps(&ticks, gap_sec)
+        .into_iter()
         .filter(|(a, z)| z > a)
         .collect()
 }
@@ -1803,14 +1874,20 @@ fn week_of_epoch(t: i64, tz: &FixedOffset) -> String {
 #[derive(Default)]
 struct WeekSegs {
     runs: u64,
-    main: Vec<(i64, i64)>, // main-session runs
-    sub: Vec<(i64, i64)>,  // subagents
+    main: Vec<(i64, i64)>,    // main-session runs
+    sub: Vec<(i64, i64)>,     // subagents
     all: Vec<(i64, i64)>, // threads actually working: main time is dropped while its own subagents work
+    tracked: Vec<(i64, i64)>, // the part of `all` that belongs to projects git can see
 }
 
 /// Per week: agent hours, wall-clock hours with any agent working, and how many ran at once, for the
 /// main sessions alone and again counting subagents. A segment belongs to the week it starts in.
-fn weekly_totals(builds: &[RunBuild], subs: &[SubWork], tz: &FixedOffset) -> Vec<WeeklyTotal> {
+fn weekly_totals(
+    builds: &[RunBuild],
+    subs: &[SubWork],
+    tz: &FixedOffset,
+    outcomes: &git_outcomes::Outcomes,
+) -> Vec<WeeklyTotal> {
     let mut cut: BTreeMap<&str, Vec<(i64, i64)>> = BTreeMap::new();
     for s in subs {
         cut.entry(s.session.as_str())
@@ -1825,13 +1902,18 @@ fn weekly_totals(builds: &[RunBuild], subs: &[SubWork], tz: &FixedOffset) -> Vec
     for b in builds {
         weeks.entry(week_start(&b.run.date)).or_default().runs += 1;
         let parent_cut = cut.get(b.session.as_str());
+        let tracked = outcomes.tracked.contains(&b.run.project);
         for &(a, z) in b.segs.iter().filter(|(a, z)| z > a) {
             let w = weeks.entry(week_of_epoch(a, tz)).or_default();
             w.main.push((a, z));
-            match parent_cut {
-                Some(c) => w.all.extend(subtract_intervals((a, z), c)),
-                None => w.all.push((a, z)),
+            let working = match parent_cut {
+                Some(c) => subtract_intervals((a, z), c),
+                None => vec![(a, z)],
+            };
+            if tracked {
+                w.tracked.extend(working.iter().copied());
             }
+            w.all.extend(working);
         }
     }
     for s in subs {
@@ -1839,7 +1921,14 @@ fn weekly_totals(builds: &[RunBuild], subs: &[SubWork], tz: &FixedOffset) -> Vec
             let w = weeks.entry(week_of_epoch(a, tz)).or_default();
             w.sub.push((a, z));
             w.all.push((a, z));
+            if outcomes.tracked.contains(&s.project) {
+                w.tracked.push((a, z));
+            }
         }
+    }
+    // a week with merges or commits but no agent activity is still a week worth showing
+    for week in outcomes.weekly.keys() {
+        weeks.entry(week.clone()).or_default();
     }
     let hours = |secs: i64| secs as f64 / 3600.0;
     let avg = |total: i64, union: i64| {
@@ -1855,6 +1944,16 @@ fn weekly_totals(builds: &[RunBuild], subs: &[SubWork], tz: &FixedOffset) -> Vec
             let (m_tot, m_uni, m_peak) = sweep(&w.main);
             let (a_tot, a_uni, a_peak) = sweep(&w.all);
             let (s_tot, _, s_peak) = sweep(&w.sub);
+            let tracked_secs: i64 = w.tracked.iter().map(|(a, z)| z - a).sum();
+            let out = outcomes.weekly.get(&week).copied().unwrap_or_default();
+            let landed = out.merged_prs + out.other_merges;
+            let per_hour = |n: u64| {
+                if tracked_secs > 0 {
+                    n as f64 / hours(tracked_secs)
+                } else {
+                    0.0
+                }
+            };
             WeeklyTotal {
                 week,
                 runs: w.runs,
@@ -1868,6 +1967,105 @@ fn weekly_totals(builds: &[RunBuild], subs: &[SubWork], tz: &FixedOffset) -> Vec
                 union_hours_all: hours(a_uni),
                 avg_parallel_all: avg(a_tot, a_uni),
                 peak_parallel_all: a_peak as u32,
+                hours_tracked: hours(tracked_secs),
+                merged_prs: out.merged_prs,
+                other_merges: out.other_merges,
+                landed,
+                commits: out.commits,
+                landed_per_agent_hour: per_hour(landed),
+                prs_per_agent_hour: per_hour(out.merged_prs),
+                commits_per_agent_hour: per_hour(out.commits),
+            }
+        })
+        .collect()
+}
+
+/// Every interval in which an agent was working, subagents included. A main session that is only waiting
+/// on its own subagents is dropped while they work, the same rule `weekly_totals` applies.
+fn working_threads(builds: &[RunBuild], subs: &[SubWork]) -> Vec<(i64, i64)> {
+    let mut cut: BTreeMap<&str, Vec<(i64, i64)>> = BTreeMap::new();
+    for s in subs {
+        cut.entry(s.session.as_str())
+            .or_default()
+            .extend(s.segs.iter().copied());
+    }
+    let cut: BTreeMap<&str, Vec<(i64, i64)>> = cut
+        .into_iter()
+        .map(|(k, v)| (k, merge_intervals(v)))
+        .collect();
+    let mut out = Vec::new();
+    for b in builds {
+        let parent_cut = cut.get(b.session.as_str());
+        for &(a, z) in b.segs.iter().filter(|(a, z)| z > a) {
+            match parent_cut {
+                Some(c) => out.extend(subtract_intervals((a, z), c)),
+                None => out.push((a, z)),
+            }
+        }
+    }
+    out.extend(
+        subs.iter()
+            .flat_map(|s| s.segs.iter().copied())
+            .filter(|(a, z)| z > a),
+    );
+    out
+}
+
+/// One cell of the weekday x hour heatmap: agent work that started in that local hour of that weekday.
+#[derive(Debug, Clone, Serialize)]
+struct HeatCell {
+    weekday: u8,       // 0 = Monday
+    hour: u8,          // local hour of day, 0-23
+    hours: f64,        // agent-working hours in this cell, over the whole window
+    avg_parallel: f64, // time-weighted agents working, while any was working in this cell
+    peak_parallel: u32,
+}
+
+/// Split one interval at local hour boundaries, tagging each piece with its local (weekday, hour).
+fn split_by_local_hour(seg: (i64, i64), tz: &FixedOffset) -> Vec<(u8, u8, (i64, i64))> {
+    let off = tz.local_minus_utc() as i64;
+    let (mut a, end) = seg;
+    let mut out = Vec::new();
+    while a < end {
+        let local = a + off;
+        // the next local hour boundary, expressed back in unix seconds; always after `a`
+        let next = (local.div_euclid(3600) + 1) * 3600 - off;
+        let z = end.min(next);
+        if let Some(d) = DateTime::from_timestamp(local, 0) {
+            out.push((
+                d.weekday().num_days_from_monday() as u8,
+                d.hour() as u8,
+                (a, z),
+            ));
+        }
+        a = z;
+    }
+    out
+}
+
+/// All 168 weekday x hour cells. Each cell's parallelism is computed from the pieces that fell in it,
+/// so the same sweep as the weekly chart applies within the cell.
+fn heatmap(threads: &[(i64, i64)], tz: &FixedOffset) -> Vec<HeatCell> {
+    let mut cells: BTreeMap<(u8, u8), Vec<(i64, i64)>> = BTreeMap::new();
+    for &seg in threads.iter().filter(|(a, z)| z > a) {
+        for (wd, h, piece) in split_by_local_hour(seg, tz) {
+            cells.entry((wd, h)).or_default().push(piece);
+        }
+    }
+    (0..7u8)
+        .flat_map(|wd| (0..24u8).map(move |h| (wd, h)))
+        .map(|(wd, h)| {
+            let (total, union, peak) = cells.get(&(wd, h)).map(|v| sweep(v)).unwrap_or((0, 0, 0));
+            HeatCell {
+                weekday: wd,
+                hour: h,
+                hours: total as f64 / 3600.0,
+                avg_parallel: if union > 0 {
+                    total as f64 / union as f64
+                } else {
+                    0.0
+                },
+                peak_parallel: peak.max(0) as u32,
             }
         })
         .collect()
@@ -2024,11 +2222,28 @@ fn run() -> Result<()> {
         if !segs.is_empty() {
             sub_work.push(SubWork {
                 session: format!("{}/{}", folder_key(path), parent),
+                project: project_name.clone(),
                 segs,
             });
         }
     }
     let mut run_builds = dedupe_runs(run_builds);
+    // Git: only for projects that have agent activity in the window, using each project's working directory.
+    let outcomes = if args.no_git {
+        git_outcomes::Outcomes::default()
+    } else {
+        let active: BTreeSet<&str> = run_builds
+            .iter()
+            .map(|b| b.run.project.as_str())
+            .chain(sub_work.iter().map(|s| s.project.as_str()))
+            .collect();
+        let projects: Vec<(String, PathBuf)> = folder_projects
+            .values()
+            .filter(|(name, _)| active.contains(name.as_str()))
+            .filter_map(|(name, cwd)| cwd.as_ref().map(|c| (name.clone(), PathBuf::from(c))))
+            .collect();
+        git_outcomes::collect(&projects, &args.git_author, (from, to), tz())
+    };
     run_builds.sort_by_key(|b| b.run.start);
 
     for (jsonl_path, sess_meta, mut events) in loaded {
@@ -2513,7 +2728,9 @@ fn run() -> Result<()> {
         by_weekday: by_weekday_v,
         by_trigger: Vec::new(),
         runs_weekly: Vec::new(),
-        runs_weekly_total: weekly_totals(&run_builds, &sub_work, tz()),
+        runs_weekly_total: weekly_totals(&run_builds, &sub_work, tz(), &outcomes),
+        runs_heat: heatmap(&working_threads(&run_builds, &sub_work), tz()),
+        runs_git: outcomes.summary,
         runs: Vec::new(),
     };
     report.runs = run_builds.into_iter().map(|b| b.run).collect();
@@ -2756,6 +2973,7 @@ mod run_tests {
             command: None,
             skills: vec![],
             interrupted: false,
+            tool_result: false,
             sidechain: false,
             uuid: None,
         }
@@ -2945,8 +3163,12 @@ mod run_tests {
         r[0].session = session.into();
         r.remove(0)
     }
+    fn totals(b: &[RunBuild], s: &[SubWork], tz: &FixedOffset) -> Vec<WeeklyTotal> {
+        weekly_totals(b, s, tz, &git_outcomes::Outcomes::default())
+    }
     fn sub(session: &str, a: i64, b: i64) -> SubWork {
         SubWork {
+            project: "p".into(),
             session: session.into(),
             segs: vec![(a, b)],
         }
@@ -2961,7 +3183,7 @@ mod run_tests {
             main_run("s3", base + 1000, base + 1100),
             main_run("s4", base + 1100, base + 1200),
         ];
-        let t = weekly_totals(&runs, &[], &utc());
+        let t = totals(&runs, &[], &utc());
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].peak_parallel, 2);
         // agent = 600+600+100+100 = 1400 s; union = [0,900] + [1000,1200] = 1100 s
@@ -2979,7 +3201,7 @@ mod run_tests {
     #[test]
     fn a_main_agent_waiting_on_one_subagent_counts_once_not_twice() {
         let base = t0();
-        let t = weekly_totals(
+        let t = totals(
             &[main_run("s1", base, base + 600)],
             &[sub("s1", base, base + 600)],
             &utc(),
@@ -3003,7 +3225,7 @@ mod run_tests {
     fn parallel_subagents_show_up_and_the_main_agents_waiting_time_is_dropped() {
         let base = t0();
         // main works 0..600; subagent A 60..540 and B 120..480 overlap each other
-        let t = weekly_totals(
+        let t = totals(
             &[main_run("s1", base, base + 600)],
             &[
                 sub("s1", base + 60, base + 540),
@@ -3031,7 +3253,7 @@ mod run_tests {
     #[test]
     fn subagents_of_another_session_do_not_cancel_this_sessions_main_time() {
         let base = t0();
-        let t = weekly_totals(
+        let t = totals(
             &[main_run("s1", base, base + 600)],
             &[sub("other", base, base + 600)],
             &utc(),
@@ -3045,10 +3267,10 @@ mod run_tests {
     #[test]
     fn work_counts_in_the_week_it_starts_in() {
         let sunday_late = t0() - 8 * 3600 + 6 * 86400 + 23 * 3600 + 50 * 60; // Sun 2026-11-15 23:50 UTC
-        let t = weekly_totals(&[], &[sub("s1", sunday_late, sunday_late + 1200)], &utc());
+        let t = totals(&[], &[sub("s1", sunday_late, sunday_late + 1200)], &utc());
         assert_eq!((t.len(), t[0].week.as_str()), (1, "2026-11-09"));
         // the same instant is already Monday in +08:00
-        let t8 = weekly_totals(
+        let t8 = totals(
             &[],
             &[sub("s1", sunday_late, sunday_late + 1200)],
             &FixedOffset::east_opt(8 * 3600).unwrap(),
@@ -3104,6 +3326,132 @@ mod run_tests {
         assert_eq!(agent_segments(&evs, CAP), vec![(0, 100), (100, 1000)]);
     }
 
+    fn tick(t: i64, bash: bool, tool_result: bool) -> Tick {
+        Tick {
+            t,
+            bash,
+            tool_result,
+        }
+    }
+
+    #[test]
+    fn a_bash_call_waiting_for_its_result_gets_two_hours_and_every_other_gap_gets_the_short_cap() {
+        let call = tick(0, true, false);
+        let result = tick(3 * 3600, false, true);
+        // the 3 h wait is the command running: counted up to the 2 h Bash cap
+        assert_eq!(steps(&[call, result], CAP), vec![(0, BASH_GAP_CAP_SEC)]);
+        // the same 3 h wait after a plain assistant line is idle time: capped at --gap
+        assert_eq!(steps(&[tick(0, false, false), result], CAP), vec![(0, CAP)]);
+        // a Bash call answered by an interrupt marker (not a tool result) is idle time too
+        let marker = tick(3 * 3600, false, false);
+        assert_eq!(steps(&[call, marker], CAP), vec![(0, CAP)]);
+        // a --gap above two hours is never cut down to the Bash cap
+        assert_eq!(steps(&[call, result], 4 * 3600), vec![(0, 3 * 3600)]);
+    }
+
+    #[test]
+    fn a_long_bash_call_counts_its_full_wait_in_a_run_and_its_segments() {
+        let bash_call = |t| Event {
+            tools: vec!["Bash".into()],
+            ..assistant(t, &[])
+        };
+        let result = |t| Event {
+            tool_result: true,
+            ..ev(Role::UserOther, t)
+        };
+        let evs = vec![
+            prompt(0, "a"),
+            bash_call(10),
+            result(10 + 3600),
+            assistant(10 + 3600 + 5, &[]),
+        ];
+        assert_eq!(build_runs(&evs, CAP, &[])[0].run.dur_sec, 10 + 3600 + 5);
+        // subagents follow the same rule, so their Bash time is not dropped from the parallelism totals
+        assert_eq!(
+            agent_segments(&[bash_call(10), result(3610)], CAP),
+            vec![(10, 3610)]
+        );
+    }
+
+    fn epoch(s: &str) -> i64 {
+        DateTime::parse_from_rfc3339(s).unwrap().timestamp()
+    }
+
+    #[test]
+    fn an_interval_is_split_at_local_hour_boundaries_and_tagged_with_its_local_hour() {
+        let utc0 = FixedOffset::east_opt(0).unwrap();
+        // 2026-11-16 is a Monday
+        let pieces = split_by_local_hour(
+            (epoch("2026-11-16T10:30:00Z"), epoch("2026-11-16T11:20:00Z")),
+            &utc0,
+        );
+        assert_eq!(
+            pieces,
+            vec![
+                (
+                    0,
+                    10,
+                    (epoch("2026-11-16T10:30:00Z"), epoch("2026-11-16T11:00:00Z"))
+                ),
+                (
+                    0,
+                    11,
+                    (epoch("2026-11-16T11:00:00Z"), epoch("2026-11-16T11:20:00Z"))
+                ),
+            ]
+        );
+        // at UTC+8 the same instant is 18:30 local: the cell is the local hour, not the UTC one
+        let taipei = FixedOffset::east_opt(8 * 3600).unwrap();
+        let local = split_by_local_hour(
+            (epoch("2026-11-16T10:30:00Z"), epoch("2026-11-16T10:45:00Z")),
+            &taipei,
+        );
+        assert_eq!(
+            local.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
+            vec![(0, 18)]
+        );
+    }
+
+    #[test]
+    fn overlapping_agents_in_one_cell_average_and_peak_together() {
+        let utc0 = FixedOffset::east_opt(0).unwrap();
+        let monday_10 = epoch("2026-11-16T10:00:00Z");
+        // two agents for the same hour, one of them for half of it
+        let threads = vec![(monday_10, monday_10 + 3600), (monday_10, monday_10 + 1800)];
+        let cells = heatmap(&threads, &utc0);
+        assert_eq!(cells.len(), 168);
+        let c = cells
+            .iter()
+            .find(|c| c.weekday == 0 && c.hour == 10)
+            .unwrap();
+        assert!((c.hours - 1.5).abs() < 1e-9, "1.5 agent hours in the cell");
+        assert!(
+            (c.avg_parallel - 1.5 / 1.0).abs() < 1e-9,
+            "1.5 agent hours over 1 hour of wall clock"
+        );
+        assert_eq!(c.peak_parallel, 2);
+        let empty = cells
+            .iter()
+            .find(|c| c.weekday == 2 && c.hour == 3)
+            .unwrap();
+        assert_eq!(
+            (empty.hours, empty.avg_parallel, empty.peak_parallel),
+            (0.0, 0.0, 0)
+        );
+    }
+
+    #[test]
+    fn the_heatmap_covers_the_same_hours_as_the_weekly_totals() {
+        let utc0 = FixedOffset::east_opt(0).unwrap();
+        let threads = vec![
+            (epoch("2026-11-16T23:30:00Z"), epoch("2026-11-17T00:45:00Z")),
+            (epoch("2026-11-17T09:00:00Z"), epoch("2026-11-17T09:10:00Z")),
+        ];
+        let total: f64 = heatmap(&threads, &utc0).iter().map(|c| c.hours).sum();
+        // 30 min before midnight + 45 min after it + 10 min later the same day
+        assert!((total - (30.0 + 45.0 + 10.0) / 60.0).abs() < 1e-9);
+    }
+
     #[test]
     fn json_embedded_in_a_script_element_cannot_end_it() {
         let v = json!({"name": "</script><!--&\u{2028}\u{2029}>", "n": 1});
@@ -3116,6 +3464,103 @@ mod run_tests {
             serde_json::from_str::<Value>(&out).unwrap(),
             v,
             "escapes are plain JSON, nothing is lost"
+        );
+    }
+
+    fn proj_run(session: &str, project: &str, a: i64, b: i64) -> RunBuild {
+        let mut r = main_run(session, a, b);
+        r.run.project = project.into();
+        r
+    }
+    fn outcomes(
+        week: &str,
+        commits: u64,
+        merged_prs: u64,
+        other_merges: u64,
+    ) -> git_outcomes::Outcomes {
+        let mut o = git_outcomes::Outcomes::default();
+        o.tracked.insert("git-p".into());
+        o.weekly.insert(
+            week.into(),
+            git_outcomes::WeekOutcome {
+                commits,
+                merged_prs,
+                other_merges,
+            },
+        );
+        o
+    }
+
+    #[test]
+    fn landings_per_agent_hour_divide_by_the_hours_of_projects_git_can_see() {
+        let base = t0();
+        // 10 min in a git project, 10 min in a project git cannot see: only the first is the denominator
+        let runs = [
+            proj_run("s1", "git-p", base, base + 600),
+            proj_run("s2", "elsewhere", base, base + 600),
+        ];
+        let t = weekly_totals(&runs, &[], &utc(), &outcomes("2026-11-09", 6, 2, 1));
+        let w = &t[0];
+        assert!(
+            (w.hours_all - 1200.0 / 3600.0).abs() < 1e-9
+                && (w.hours_tracked - 600.0 / 3600.0).abs() < 1e-9
+        );
+        assert_eq!(
+            (w.merged_prs, w.other_merges, w.landed, w.commits),
+            (2, 1, 3, 6)
+        );
+        assert!(
+            (w.landed_per_agent_hour - 18.0).abs() < 1e-9,
+            "3 landings in 1/6 tracked hour"
+        );
+        assert!((w.prs_per_agent_hour - 12.0).abs() < 1e-9);
+        assert!((w.commits_per_agent_hour - 36.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn subagent_work_in_a_git_project_counts_toward_the_tracked_hours() {
+        let base = t0();
+        let mut s = sub("s1", base + 60, base + 540);
+        s.project = "git-p".into();
+        let t = weekly_totals(
+            &[proj_run("s1", "git-p", base, base + 600)],
+            &[s],
+            &utc(),
+            &outcomes("2026-11-09", 0, 1, 0),
+        );
+        // working threads: 120 s of the main agent outside its subagent, plus the subagent's 480 s
+        assert!((t[0].hours_tracked * 3600.0 - 600.0).abs() < 1e-6);
+        assert!((t[0].hours_tracked - t[0].hours_all).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_week_with_landings_but_no_agent_activity_still_gets_a_row() {
+        let t = weekly_totals(&[], &[], &utc(), &outcomes("2026-11-02", 3, 1, 0));
+        assert_eq!(t.len(), 1);
+        assert_eq!(
+            (t[0].week.as_str(), t[0].runs, t[0].landed, t[0].commits),
+            ("2026-11-02", 0, 1, 3)
+        );
+        assert_eq!(
+            (t[0].hours_tracked, t[0].landed_per_agent_hour),
+            (0.0, 0.0),
+            "no hours, no ratio"
+        );
+    }
+
+    #[test]
+    fn without_git_every_outcome_field_is_zero() {
+        let base = t0();
+        let t = totals(&[proj_run("s1", "git-p", base, base + 600)], &[], &utc());
+        let w = &t[0];
+        assert_eq!(
+            (
+                w.landed,
+                w.commits,
+                w.hours_tracked,
+                w.landed_per_agent_hour
+            ),
+            (0, 0, 0.0, 0.0)
         );
     }
 
