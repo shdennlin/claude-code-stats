@@ -192,6 +192,8 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
             "log.showSignature=false",
             "-c",
             "protocol.ext.allow=never",
+            "-c",
+            "protocol.allow=never",
             "-C",
         ])
         .arg(dir)
