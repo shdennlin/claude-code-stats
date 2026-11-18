@@ -177,10 +177,19 @@ pub fn tally_landings(
 }
 
 /// Run git in `dir`. Paths come from transcripts, so keep git from doing anything but reading history:
-/// no prompts, no optional locks, no fsmonitor hook.
+/// no prompts, no optional locks, no fsmonitor hook. `log.showSignature` is forced off: a repository's own
+/// config could otherwise turn it on and make `git log` run its `gpg.program` on signed commits.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
-        .args(["-c", "core.fsmonitor=false", "-c", "core.pager=cat", "-C"])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "log.showSignature=false",
+            "-C",
+        ])
         .arg(dir)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")

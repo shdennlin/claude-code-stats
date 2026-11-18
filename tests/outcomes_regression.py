@@ -159,5 +159,47 @@ class Outcomes(unittest.TestCase):
         self.assertEqual(wk['2026-11-09']['landed'], 1)
 
 
+class RepoConfigCannotRunPrograms(unittest.TestCase):
+    """A repository's own config must not make reading its history run a program. A signed commit plus
+    `log.showSignature` in the repo config used to make `git log` execute `gpg.program`."""
+
+    def test_git_log_does_not_run_the_configured_gpg_program(self):
+        with tempfile.TemporaryDirectory(prefix='cc-stats-cfg-') as tmp:
+            base = Path(tmp)
+            home = base / 'home'
+            home.mkdir()
+            repo = base / 'repo'
+            g = Git(repo, home)
+            repo.mkdir()
+            g.run('init', '-q', '-b', 'main')
+            g.run('config', 'user.email', ME)
+            g.commit('init', '2026-11-02T09:00:00+00:00')
+            # a commit object with a (fake) gpgsig header: enough for git to try to verify it
+            tree = g.run('rev-parse', 'HEAD^{tree}').strip()
+            parent = g.run('rev-parse', 'HEAD').strip()
+            raw = (f'tree {tree}\nparent {parent}\nauthor {ME} <{ME}> 1790000000 +0000\n'
+                   f'committer {ME} <{ME}> 1790000000 +0000\n'
+                   'gpgsig -----BEGIN PGP SIGNATURE-----\n \n fake\n -----END PGP SIGNATURE-----\n\nsigned work (#3)\n')
+            signed = subprocess.run(['git', '-C', str(repo), 'hash-object', '-t', 'commit', '-w', '--stdin'],
+                                    input=raw, capture_output=True, text=True, check=True).stdout.strip()
+            g.run('update-ref', 'refs/heads/main', signed)
+            marker = base / 'ran'
+            gpg = base / 'evil-gpg'
+            gpg.write_text(f'#!/bin/sh\ntouch {marker}\nexit 1\n')
+            gpg.chmod(0o755)
+            g.run('config', 'log.showSignature', 'true')
+            g.run('config', 'gpg.program', str(gpg))
+
+            projects = base / 'projects'
+            rows = [prompt('2026-11-03T12:00:00Z', 'cfg', 'work', str(repo)), assistant('2026-11-03T12:10:00Z', [], str(repo))]
+            (projects / 'proj-cfg').mkdir(parents=True)
+            (projects / 'proj-cfg/s.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            env = {**os.environ, 'HOME': str(home), 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
+            r = subprocess.run([str(BIN), '--dir', str(projects), '--out', str(base / 'out'), '--all', '--tz', 'UTC',
+                                '--format', 'json'], capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(marker.exists(), 'the repository config ran gpg.program')
+
+
 if __name__ == '__main__':
     unittest.main()
